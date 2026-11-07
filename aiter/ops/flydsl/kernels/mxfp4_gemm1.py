@@ -1058,6 +1058,22 @@ def _gemm1_body(
                         issue_b_load_j(b[K_C_LOCAL], K_C, j)
             if const_expr(not _relax_prologue):
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
+        # vmcnt retires in order: quantizing a hidden tile loaded in the same
+        # step would also drain every older B stage. BM16 loads hidden
+        # k_stages - 1 tiles ahead so the B pipeline stays full.
+        hidden_dist = (
+            k_stages - 1 if (inline_quant and not prefetch_hidden and BM == 16) else 0
+        )
+        hidden_ring = []
+        for d in range_constexpr(hidden_dist):
+            if const_expr(k_stages + d < K_TILES_PER_WAVE):
+                kt_n = global_k_tile(k_stages + d)
+                hidden_ring.append(
+                    (
+                        inline_quant_load_kt(0, kt_n, cached_row_inline),
+                        inline_quant_load_kt(1, kt_n, cached_row_inline),
+                    )
+                )
         if const_expr(_relax_prologue):
             rocdl.sched_barrier(0)
             for K_C_LOCAL in range_constexpr(k_stages):
@@ -1107,8 +1123,16 @@ def _gemm1_body(
                 rocdl.sched_barrier(0)
                 issue_a_load_lds(write_slot, K_C)
             if const_expr(inline_quant and not prefetch_hidden):
-                h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-                h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
+                nxt = K_C_LOCAL + hidden_dist
+                if const_expr(nxt < K_TILES_PER_WAVE):
+                    kt_n = global_k_tile(nxt)
+                    hidden_ring.append(
+                        (
+                            inline_quant_load_kt(0, kt_n, cached_row_inline),
+                            inline_quant_load_kt(1, kt_n, cached_row_inline),
+                        )
+                    )
+                h_v0, h_v1 = hidden_ring.pop(0)
                 rocdl.sched_barrier(0)
             for J in range_constexpr(N_REPS):
                 if const_expr(BM != 128):
@@ -1554,9 +1578,15 @@ LDS_2WG_LIMIT = 65 * 1024
 
 MIN_N_BLOCKS_FOR_SHALLOW_K = 4
 
+# BM16 is the decode tile: the grid under-fills the CUs and B loads dominate,
+# so keep one more K tile of B in flight per wave.
+BM16_K_STAGES = 3
+
 
 def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits=1):
     """Pick the deepest K pipeline that still fits two workgroups per CU."""
+    if BM == 16 and k_wave == 1 and K_TILES_TOTAL >= 2 * BM16_K_STAGES:
+        return BM16_K_STAGES
     if N_OUT // BN < MIN_N_BLOCKS_FOR_SHALLOW_K:
         return kStages
     *_, lds = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, kStages)

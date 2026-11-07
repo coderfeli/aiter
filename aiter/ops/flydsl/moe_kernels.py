@@ -1876,7 +1876,10 @@ def _flydsl_moe_stage1_impl(
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)
-    _run_compiled(exe, args)
+    if hasattr(exe, "sort_block_m"):
+        exe.run(args, sorted_expert_ids, num_valid_ids, 6, _grid_y)
+    else:
+        _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None

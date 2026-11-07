@@ -1930,24 +1930,37 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 
         opus::index_t total_elem = rounded_tokens * kargs.topk_mdiv.divisor / index_pack;
 
-#pragma unroll index_pack
-        for(opus::index_t i = threadIdx.x; i < total_elem; i += kBlockSize)
+        // Every workgroup scans all routes, so the loop is load-latency bound:
+        // issue kLoadBatch loads per thread before testing any of them.
+        constexpr opus::index_t kLoadBatch = 16;
+        for(opus::index_t i0 = threadIdx.x; i0 < total_elem; i0 += kBlockSize * kLoadBatch)
         {
-            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
-                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
-            opus::static_for<index_pack>([&](auto j) {
-                IndexType eid_x = x[j.value]; // ext_vector_type must use int to []
-                if(eid_x == eid)
+            topk_id_t xs[kLoadBatch];
+            opus::static_for<kLoadBatch>([&](auto b) {
+                const opus::index_t i = i0 + b.value * kBlockSize;
+                if(i < total_elem)
+                    xs[b.value] = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
+                        p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
+            });
+            opus::static_for<kLoadBatch>([&](auto b) {
+                const opus::index_t i = i0 + b.value * kBlockSize;
+                if(i < total_elem)
                 {
-                    uint32_t curr_token_id, curr_topk_id;
-                    kargs.topk_mdiv.divmod(i * index_pack + j, curr_token_id, curr_topk_id);
-                    if constexpr(Problem::LocalToken)
-                    {
-                        if(static_cast<opus::index_t>(curr_token_id) < tokens)
-                            p_expert_mesh[curr_token_id] = (curr_topk_id + 1) & 0xffff;
-                    }
-                    else
-                        p_expert_mesh[curr_token_id] = (curr_topk_id + 1) & 0xffff;
+                    opus::static_for<index_pack>([&](auto j) {
+                        IndexType eid_x = xs[b.value][j.value]; // ext_vector_type must use int to []
+                        if(eid_x == eid)
+                        {
+                            uint32_t curr_token_id, curr_topk_id;
+                            kargs.topk_mdiv.divmod(i * index_pack + j, curr_token_id, curr_topk_id);
+                            if constexpr(Problem::LocalToken)
+                            {
+                                if(static_cast<opus::index_t>(curr_token_id) < tokens)
+                                    p_expert_mesh[curr_token_id] = (curr_topk_id + 1) & 0xffff;
+                            }
+                            else
+                                p_expert_mesh[curr_token_id] = (curr_topk_id + 1) & 0xffff;
+                        }
+                    });
                 }
             });
         }
@@ -3721,7 +3734,9 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             }
         };
 
-        if(a.tokens < 2048)
+        // P0_v2 (2 launches) scans all tokens * topk ids per expert; past ~4096 x 9 ids the
+        // clear + P0_v1 + P1 chain (4 launches) is cheaper (gfx950, 257 experts).
+        if(a.tokens < 2048 || a.tokens * a.topk <= 36864)
         {
             if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts,
                                                           a.p_local_topk_ids != nullptr) >
