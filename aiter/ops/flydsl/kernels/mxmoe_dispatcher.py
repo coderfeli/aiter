@@ -604,7 +604,8 @@ def compile_gemm2_a4w4_port(
                 fx.Int32(0), mn_idx=mn_idx, pair_row_e=pair_row_e, a_valid_rows=nv
             )
         elif const_expr(_pair_role == 2):
-            # Entry y = (block << 16) | (is_pair << 15) | expert; y >= count idles.
+            # Entry y = (block << 16) | (is_pair << 15) | (is_half << 14) | expert;
+            # y >= count idles.
             y = _udiv(bx_i32, num_n_blocks)
             n_block = bx_i32 - y * num_n_blocks
             pw = global_typed_ptr(arg_eids, T.i32)
@@ -613,7 +614,7 @@ def compile_gemm2_a4w4_port(
             if fx.Int32(y) < fx.Int32(count):
                 row_e = (
                     (packed >> fx.Int32(16)) * fx.Int32(BM),
-                    packed & fx.Int32(0x7FFF),
+                    packed & fx.Int32(0x3FFF),
                 )
                 mn = (fx.Int32(0), n_block)
                 if ((packed >> fx.Int32(15)) & fx.Int32(1)) == fx.Int32(1):
@@ -1132,6 +1133,8 @@ def mxfp4_moe_gemm2(
             pw = build_pair_worklist(
                 sorted_expert_ids,
                 cumsum_tensor,
+                sorted_token_ids,
+                M_logical,
                 SBM,
                 torch.cuda.current_stream() if stream is None else stream,
             )

@@ -247,6 +247,18 @@ __all__ = [
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
 register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
+register_fused_moe_impl(
+    "flydsl_mxfp4_direct",
+    "aiter.ops.flydsl.mxfp4_moe_direct:run_mxfp4_moe_direct_impl",
+)
+register_fused_moe_impl(
+    "flydsl_mxfp4_fold",
+    "aiter.ops.flydsl.mxfp4_moe_fold:run_mxfp4_moe_fold_impl",
+)
+register_fused_moe_impl(
+    "flydsl_mxfp4_fold2",
+    "aiter.ops.flydsl.mxfp4_moe_fold2:run_mxfp4_moe_fold2_impl",
+)
 
 
 def __getattr__(name: str):

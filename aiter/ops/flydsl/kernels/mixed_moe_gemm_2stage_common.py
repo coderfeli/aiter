@@ -171,11 +171,20 @@ def compile_mixed_moe_gemm1_common(
     # which would put the emitter's address in the cache key.
     pair_body = pair_lds_cell = None
     pair_pong_bytes = pair_ping_bytes = 0
+    # A single whose valid rows fit in its first half runs a half-height body
+    # (role 3): the leftover block of an expert holds few rows.
+    half_body = half_lds_cell = None
+    half_pong_bytes = half_ping_bytes = 0
+    use_half = __import__("os").environ.get("G1_HALF_TMP", "1") == "1"
     if pair_unified and _pair_role == 0:
         kw = {k: v for k, v in locals().items() if k in _GEMM1_KWARGS}
         pair_body, pair_lds_cell, pair_pong_bytes, pair_ping_bytes = (
             compile_mixed_moe_gemm1_common(**kw, _pair_role=1)
         )
+        if use_half:
+            half_body, half_lds_cell, half_pong_bytes, half_ping_bytes = (
+                compile_mixed_moe_gemm1_common(**kw, _pair_role=3)
+            )
         _pair_role = 2
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -200,6 +209,8 @@ def compile_mixed_moe_gemm1_common(
     sort_block_m = tile_m
     if _pair_role == 1:
         tile_m = 2 * sort_block_m
+    elif _pair_role == 3:
+        tile_m = sort_block_m // 2
     num_waves = min(4, tile_n // 32)
     # K-wave groups reduce accumulators in LDS before the epilogue.
     num_n_waves = num_waves
@@ -304,6 +315,7 @@ def compile_mixed_moe_gemm1_common(
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
     v2out_tag += "_pu" if _pair_role else ""
+    v2out_tag += "h" if half_body is not None else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -491,8 +503,8 @@ def compile_mixed_moe_gemm1_common(
 
     _pu_lds = [None]
     if _pair_role == 2:
-        pu_pong_bytes = max(pong_field_bytes, pair_pong_bytes)
-        pu_ping_bytes = max(ping_field_bytes, pair_ping_bytes)
+        pu_pong_bytes = max(pong_field_bytes, pair_pong_bytes, half_pong_bytes)
+        pu_ping_bytes = max(ping_field_bytes, pair_ping_bytes, half_ping_bytes)
 
         @fx.struct
         class _PairSmem:
@@ -2796,7 +2808,8 @@ def compile_mixed_moe_gemm1_common(
                 gpu.barrier()
 
             def _worklist_iter():
-                # Entry y = (block << 16) | (is_pair << 15) | expert; y >= count idles.
+                # Entry y = (block << 16) | (is_pair << 15) | (is_half << 14) | expert;
+                # y >= count idles.
                 nonlocal bx, bx_m, bx_m_i32, blk_valid
                 nonlocal expert_i32, expert_idx, exp_valid
                 count = buffer_ops.buffer_load(
@@ -2807,14 +2820,21 @@ def compile_mixed_moe_gemm1_common(
                         expert_rsrc, bx_persist + 1, vec_width=1, dtype=T.i32
                     )
                 )
-                is_pair = (packed >> fx.Int32(15)) & fx.Int32(1)
+                if const_expr(_pair_role == 1):
+                    role = (packed >> fx.Int32(15)) & fx.Int32(1)
+                elif const_expr(_pair_role == 3):
+                    role = (packed >> fx.Int32(14)) & fx.Int32(3)
+                elif const_expr(half_body is not None):
+                    role = (packed >> fx.Int32(14)) & fx.Int32(3)
+                else:
+                    role = (packed >> fx.Int32(15)) & fx.Int32(1)
                 blk_valid = (
                     fx.Uint32(fx.Int32(bx_persist)) < fx.Uint32(count)
-                ) & (is_pair == fx.Int32(1 if _pair_role == 1 else 0))
+                ) & (role == fx.Int32(1 if _pair_role in (1, 3) else 0))
                 bx = fx.Index(packed >> fx.Int32(16))
                 bx_m = bx * sort_block_m
                 bx_m_i32 = fx.Int32(bx_m)
-                expert_i32 = packed & fx.Int32(0x7FFF)
+                expert_i32 = packed & fx.Int32(0x3FFF)
                 expert_idx = fx.Index(expert_i32)
                 exp_valid = fx.Uint32(expert_i32) < fx.Uint32(experts)
                 _gemm1_dispatch()
@@ -2835,7 +2855,7 @@ def compile_mixed_moe_gemm1_common(
             else:
                 _run_persist()
 
-    if _pair_role == 1:
+    if _pair_role in (1, 3):
         return _emit_moe_gemm1, _pu_lds, pong_field_bytes, ping_field_bytes
 
     if heterogeneous_b:
@@ -2942,6 +2962,32 @@ def compile_mixed_moe_gemm1_common(
                     f32_situ_linear_beta_rcp,
                     f32_swiglu_limit,
                 )
+                if const_expr(half_body is not None):
+                    half_lds_cell[0] = _pu_lds[0]
+                    half_body(
+                        arg_out,
+                        arg_x,
+                        arg_w,
+                        arg_scale_x,
+                        arg_scale_w,
+                        arg_w,
+                        arg_scale_w,
+                        arg_sorted_token_ids,
+                        arg_expert_ids,
+                        arg_sorted_weights,
+                        arg_num_valid_ids,
+                        arg_bias,
+                        arg_out_scale_sorted,
+                        i32_tokens_in,
+                        i32_n_in,
+                        i32_k_in,
+                        i32_size_expert_ids_in,
+                        f32_situ_beta,
+                        f32_situ_beta_rcp,
+                        f32_situ_linear_beta,
+                        f32_situ_linear_beta_rcp,
+                        f32_swiglu_limit,
+                    )
             _emit_moe_gemm1(
                 arg_out,
                 arg_x,

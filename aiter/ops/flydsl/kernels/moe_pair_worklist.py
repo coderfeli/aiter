@@ -10,7 +10,11 @@ three blocks (a longer run only loses pairs, never overlaps them). Layout of
 ``pw`` (int32):
 
     pw[0]        number of entries
-    pw[1 + i]    (block << 16) | (is_pair << 15) | expert, in block order
+    pw[1 + i]    (block << 16) | (is_pair << 15) | (is_half << 14) | expert,
+                 in block order
+
+``is_half`` marks a single whose valid rows fit in its first half (row
+``sort_block_m // 2`` is padding); stage 1 runs it with a half-height tile.
 
 One wave; each of ``CHUNKS`` unrolled chunks covers 64 blocks, so all
 expert-id loads of a pass are issued before the first ballot.
@@ -47,17 +51,21 @@ _cache = {}
 def get_pair_worklist(sort_block_m: int):
     if sort_block_m in _cache:
         return _cache[sort_block_m]
+    half_row = sort_block_m // 2
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def pair_worklist_kernel(
         pw: fx.Tensor,
         expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        sorted_ids: fx.Tensor,
         i32_size: fx.Int32,
+        i32_m: fx.Int32,
     ):
         lane = fx.Int32(gpu.thread_idx.x)
         pw_it = _buf_iter(pw)
         e_it = _buf_iter(expert_ids)
+        s_it = _buf_iter(sorted_ids)
         nv = _gld(_buf_iter(num_valid_ids), fx.Int32(0))
         c0 = fx.Int32(0)
         c1 = fx.Int32(1)
@@ -70,6 +78,7 @@ def get_pair_worklist(sort_block_m: int):
             cnt = state[0]
             base = fx.Int32(p) * fx.Int32(64 * CHUNKS) + lane
             ev = []
+            hv = []
             for c in range_constexpr(CHUNKS):
                 b = base + fx.Int32(64 * c)
                 # e[b - LOOKBACK .. b + 1]; indices below 0 are clamped and
@@ -79,6 +88,8 @@ def get_pair_worklist(sort_block_m: int):
                     i = b + fx.Int32(d)
                     row.append(_gld(e_it, (i > c0).select(i, c0)))
                 ev.append(row)
+                bc = (b < nb).select(b, c0)
+                hv.append(_gld(s_it, bc * fx.Int32(sort_block_m) + fx.Int32(half_row)))
             for c in range_constexpr(CHUNKS):
                 b = base + fx.Int32(64 * c)
                 row = ev[c]
@@ -101,9 +112,13 @@ def get_pair_worklist(sort_block_m: int):
                 mt = fx.Int64(fly_rocdl.ballot(T.i64, take))
                 rt = fx.Int32(fx.math.ctpop(mt & lt_mask))
                 e = row[LOOKBACK]
+                half = (~lead) & (
+                    (hv[c] & fx.Int32(0xFFFFFF)) >= i32_m
+                )
                 packed = (
                     (b << fx.Int32(16))
                     | (lead.select(fx.Int32(1 << 15), c0))
+                    | (half.select(fx.Int32(1 << 14), c0))
                     | e
                 )
                 if take:
@@ -119,11 +134,15 @@ def get_pair_worklist(sort_block_m: int):
         pw: fx.Tensor,
         expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        sorted_ids: fx.Tensor,
         i32_size: fx.Int32,
+        i32_m: fx.Int32,
         stream: fx.Stream = None,
     ):
         stream = stream if stream is not None else fx.Stream(None)
-        pair_worklist_kernel(pw, expert_ids, num_valid_ids, i32_size).launch(
+        pair_worklist_kernel(
+            pw, expert_ids, num_valid_ids, sorted_ids, i32_size, i32_m
+        ).launch(
             grid=(1, 1, 1), block=(64, 1, 1), stream=stream
         )
 
@@ -136,7 +155,9 @@ def get_pair_worklist(sort_block_m: int):
 _LAST = {}
 
 
-def build_pair_worklist(sorted_expert_ids, num_valid_ids, sort_block_m, stream):
+def build_pair_worklist(
+    sorted_expert_ids, num_valid_ids, sorted_token_ids, num_tokens, sort_block_m, stream
+):
     size = int(sorted_expert_ids.shape[0])
     pw = torch.empty(1 + size, dtype=torch.int32, device=sorted_expert_ids.device)
     _run_compiled(
@@ -144,7 +165,9 @@ def build_pair_worklist(sorted_expert_ids, num_valid_ids, sort_block_m, stream):
         pw,
         sorted_expert_ids,
         num_valid_ids,
+        sorted_token_ids,
         size,
+        int(num_tokens),
         stream,
     )
     return pw
@@ -161,7 +184,16 @@ class PairUnifiedLaunch:
         self.exe = exe
         self.sort_block_m = sort_block_m
 
-    def run(self, args, sorted_expert_ids, num_valid_ids, eid_arg_pos, size):
+    def run(
+        self,
+        args,
+        sorted_expert_ids,
+        num_valid_ids,
+        eid_arg_pos,
+        size,
+        sorted_token_ids,
+        num_tokens,
+    ):
         from .tensor_shim import ptr_arg
 
         size = int(size)
@@ -172,7 +204,9 @@ class PairUnifiedLaunch:
             pw,
             sorted_expert_ids,
             num_valid_ids,
+            sorted_token_ids,
             size,
+            int(num_tokens),
             stream,
         )
         _LAST[sorted_expert_ids.data_ptr()] = pw

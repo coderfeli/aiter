@@ -1877,7 +1877,15 @@ def _flydsl_moe_stage1_impl(
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)
     if hasattr(exe, "sort_block_m"):
-        exe.run(args, sorted_expert_ids, num_valid_ids, 6, _grid_y)
+        exe.run(
+            args,
+            sorted_expert_ids,
+            num_valid_ids,
+            6,
+            _grid_y,
+            sorted_token_ids,
+            token_num,
+        )
     else:
         _run_compiled(exe, args)
 
