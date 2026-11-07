@@ -98,6 +98,10 @@ class DispatchSlot(IntEnum):
     XCD_ACQ = (
         35  # per-XCD i64 copy of PLAN_NV, republished after that XCD's L2 invalidation
     )
+    # dedup_rows: byte offsets of the token-row regions (one row per source rank and token) from the payload rows
+    # and from their scales; the same on every rank (symmetric heap).
+    TOKEN_ROWS = 36
+    TOKEN_SCALES = 37
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -184,6 +188,7 @@ def prefetch_direct_fixed_slot_route(
     dispatch_blocks,
     producer_slot,
     route_offset=0,
+    dedup=False,
 ):
     """Load everything the (single) route of this wave needs that does not depend on the epoch gate.
 
@@ -238,7 +243,19 @@ def prefetch_direct_fixed_slot_route(
         fz_scale_n_i32,
     )
     weight = load_at(AddrBuffer(addr_in_wts), wk, fx.Float32, 1)
+    # dedup: only the token's first route to a destination sends the row, into the token-row region.
+    extra = {}
+    if const_expr(dedup):
+        topk_slot = wk - source_token * fx.Int32(fz_k)
+        duplicate = topk_slot < fx.Int32(0)
+        for j in range_constexpr(fz_k - 1):
+            ej = load_at(AddrBuffer(addr_in_idx), source_token * fx.Int32(fz_k) + fx.Int32(j), fx.Int32, 1)
+            same = (ej >= fx.Int32(0)) & (ej < fx.Int32(fz_total_experts)) & (ej // fx.Int32(fz_epr) == destination)
+            duplicate = duplicate | ((fx.Int32(j) < topk_slot) & same)
+        extra = {"duplicate": duplicate, "token_rows": dp(DispatchSlot.TOKEN_ROWS),
+                 "token_scales": dp(DispatchSlot.TOKEN_SCALES)}
     return {
+        **extra,
         "tables": tables,
         "global_expert": global_expert,
         "remote": remote,
@@ -254,6 +271,7 @@ def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
+    dedup=False,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots."""
@@ -296,15 +314,27 @@ def emit_direct_fixed_slot_payload(
             publish = valid_expert & (expert_offset < fx.Int32(fz_cap))
             payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
 
+            if const_expr(dedup):
+                if publish & ~rpf["duplicate"]:
+                    token_row = fx.Int64(fz_rank * fz_mtpr) + fx.Int64(source_token)
+                    destination_rsrc = AddrBuffer(
+                        rpf["remote"]["rx"] + rpf["token_rows"] + token_row * fx.Int64(fz_nbytes))
+                    for i in range_constexpr(len(row_values)):
+                        store_at(row_values[i], destination_rsrc, lane * fx.Int32(4) + fx.Int32(i * 256))
+                    if const_expr(fz_enable_scales):
+                        if lane < fx.Int32(fz_scale_n_i32):
+                            store_at(rpf["scale"], AddrBuffer(rpf["remote"]["sc"] + rpf["token_scales"]
+                                + token_row * fx.Int64(fz_scale_n_i32 * 4)), lane)
             if publish:
-                destination_rsrc = AddrBuffer(rpf["remote"]["rx"] + fx.Int64(payload_row) * fx.Int64(fz_nbytes))
-                for i in range_constexpr(len(row_values)):
-                    store_at(row_values[i], destination_rsrc, lane * fx.Int32(4) + fx.Int32(i * 256))
+                if const_expr(not dedup):
+                    destination_rsrc = AddrBuffer(rpf["remote"]["rx"] + fx.Int64(payload_row) * fx.Int64(fz_nbytes))
+                    for i in range_constexpr(len(row_values)):
+                        store_at(row_values[i], destination_rsrc, lane * fx.Int32(4) + fx.Int32(i * 256))
 
-                if const_expr(fz_enable_scales):
-                    if lane < fx.Int32(fz_scale_n_i32):
-                        store_at(rpf["scale"], AddrBuffer(rpf["remote"]["sc"]),
-                            payload_row * fx.Int32(fz_scale_n_i32) + lane)
+                    if const_expr(fz_enable_scales):
+                        if lane < fx.Int32(fz_scale_n_i32):
+                            store_at(rpf["scale"], AddrBuffer(rpf["remote"]["sc"]),
+                                payload_row * fx.Int32(fz_scale_n_i32) + lane)
 
                 if lane == fx.Int32(0):
                     weight_bits = fx.Vector.from_elements([rpf["weight"]], fx.Float32).bitcast(fx.Int32)[0]
@@ -339,7 +369,7 @@ def emit_direct_fixed_slot_finalize(
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
     """
-    assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
+    assert 0 < fz_epr <= 128, "direct fixed-slot finalize requires 1..128 experts per rank"
     rdisp = AddrBuffer(addr_disp)
 
     def dp(i):
@@ -361,36 +391,53 @@ def emit_direct_fixed_slot_finalize(
             comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
 
-        valid_expert = lane < fx.Int32(fz_epr)
-        safe_expert = valid_expert.select(lane, fx.Int32(0))
-        count = load_at(AddrBuffer(a_running), safe_expert, fx.Int32, 1)
-        count = valid_expert.select(count, fx.Int32(0))
-        overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
-        overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
-        overflow_count = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, fz_epr - 1))
-        no_overflow = overflow_count == fx.Int32(0)
-        safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
-        num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-        inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
-        metadata_base = inclusive_tiles - num_expert_tiles
-        total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
-        routed_rows = fx.Int32(
-            fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), fz_epr - 1)
-        )
-        hot_expert = _wave_reduce_max_i32(safe_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
+        # One expert per lane and 64-expert chunk; the scans carry across chunks.
+        num_chunks = (fz_epr + 63) // 64
+        chunks = []
+        for chunk in range_constexpr(num_chunks):
+            last_lane = min(63, fz_epr - chunk * 64 - 1)
+            expert = lane + fx.Int32(chunk * 64) if const_expr(chunk > 0) else lane
+            valid_expert = lane < fx.Int32(last_lane + 1)
+            safe_expert = valid_expert.select(expert, fx.Int32(0))
+            count = load_at(AddrBuffer(a_running), safe_expert, fx.Int32, 1)
+            count = valid_expert.select(count, fx.Int32(0))
+            overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
+            overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
+            chunk_overflow = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, last_lane))
+            overflow_count = chunk_overflow if const_expr(chunk == 0) else overflow_count + chunk_overflow
+            if const_expr(chunk == num_chunks - 1):
+                no_overflow = overflow_count == fx.Int32(0)
+            safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
+            num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+            inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
+            metadata_base = inclusive_tiles - num_expert_tiles
+            chunk_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, last_lane))
+            chunk_rows = fx.Int32(fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), last_lane))
+            chunk_max = _wave_reduce_max_i32(safe_count, lane)
+            if const_expr(chunk == 0):
+                total_tiles, routed_rows, max_count = chunk_tiles, chunk_rows, chunk_max
+            else:
+                metadata_base = metadata_base + total_tiles
+                total_tiles = total_tiles + chunk_tiles
+                routed_rows = routed_rows + chunk_rows
+                max_count = (chunk_max > max_count).select(chunk_max, max_count)
+            chunks.append((valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base))
+        hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
 
-        if valid_expert:
-            if no_overflow:
-                global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
-                payload_base = safe_expert * fx.Int32(fz_cap)
-                for tile in range(fx.Int32(0), num_expert_tiles, 1):
-                    metadata_index = metadata_base + tile
-                    store_at(global_expert, AddrBuffer(a_se), metadata_index)
-                    store_at(payload_base + tile * fx.Int32(fz_tile_m), AddrBuffer(a_trb), metadata_index)
-                    rows = safe_count - tile * fx.Int32(fz_tile_m)
-                    rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
-                    store_at(rows, AddrBuffer(a_tile_rows), metadata_index)
-            store_at(fx.Int32(0), AddrBuffer(a_running), safe_expert)
+        for chunk in range_constexpr(len(chunks)):
+            valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
+            if valid_expert:
+                if no_overflow:
+                    global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
+                    payload_base = safe_expert * fx.Int32(fz_cap)
+                    for tile in range(fx.Int32(0), num_expert_tiles, 1):
+                        metadata_index = metadata_base + tile
+                        store_at(global_expert, AddrBuffer(a_se), metadata_index)
+                        store_at(payload_base + tile * fx.Int32(fz_tile_m), AddrBuffer(a_trb), metadata_index)
+                        rows = safe_count - tile * fx.Int32(fz_tile_m)
+                        rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
+                        store_at(rows, AddrBuffer(a_tile_rows), metadata_index)
+                store_at(fx.Int32(0), AddrBuffer(a_running), safe_expert)
 
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
@@ -849,7 +896,7 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return npes == 8 and experts_per_rank == 48 and cap == required_cap
+    return (npes, experts_per_rank) in ((8, 48), (4, 96)) and cap == required_cap
 
 
 # fmt: off
@@ -861,7 +908,7 @@ def compile_mega_moe_stage1(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 0.0, dedup_rows: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -911,7 +958,7 @@ def compile_mega_moe_stage1(
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
-        raise ValueError("small-input stage1 needs the 8-rank, 48-expert fixed-slot layout")
+        raise ValueError("small-input stage1 needs the EP8/48-expert or EP4/96-expert fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
     # Producers load their route (expert, remote pointers, row, scales, weight) before the epoch gate and
     # quantize the bf16 input row to MXFP8. A producer wave sends pre_rounds routes (one per round) so
@@ -995,6 +1042,7 @@ def compile_mega_moe_stage1(
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}"
         f"{swiglu_suffix}"
         f"_fused{'_'.join(str(v) for v in fused)}"
+        f"{'_dd' if dedup_rows else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1021,6 +1069,8 @@ def compile_mega_moe_stage1(
         a_epoch_gate = _disp_ptr(DispatchSlot.EPOCH_GATE)
         a_work_head = _disp_ptr(DispatchSlot.WORK_HEAD)
         a_group_done = _disp_ptr(DispatchSlot.GROUP_DONE)
+        if const_expr(dedup_rows):
+            token_offsets = (_disp_ptr(DispatchSlot.TOKEN_ROWS), _disp_ptr(DispatchSlot.TOKEN_SCALES))
 
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
@@ -1092,6 +1142,7 @@ def compile_mega_moe_stage1(
                 fz_scale_n_i32=fz_scale_n_i32, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
                 addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
+                dedup=dedup_rows,
             )
             # Only the first round loads before the gate; the payload loop loads the later rounds itself.
             prefetched = [prefetch_direct_fixed_slot_route(**prefetch_args, route_offset=0)]
@@ -1107,7 +1158,7 @@ def compile_mega_moe_stage1(
                 addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                 parity=route_parity, expected=route_expected, prefetched=prefetched, route_rounds=pre_rounds,
-                prefetch_args=prefetch_args,
+                prefetch_args=prefetch_args, dedup=dedup_rows,
             )
         payload_parity, payload_expected = _load_epoch()
         if owner:
@@ -1132,6 +1183,15 @@ def compile_mega_moe_stage1(
             out_rsrc = _make_buffer(out, fx.Int16, max_size=False, num_records_bytes=out_nbytes)
         os_rsrc = _make_buffer(out_scale, fx.Int8, max_size=False, num_records_bytes=os_nbytes)
 
+        # dedup_rows: the rows sit in the token-row region (row source rank * mtpr + token) and GEMM1 maps its tile
+        # rows through the srcmap; the region offsets are read past the plan.
+        row_map = None
+        if const_expr(dedup_rows):
+            row_map = {
+                "srcmap": _make_buffer_from_addr(_disp_ptr(DispatchSlot.G2_STIDS), fx.Int32),
+                # A constant bound keeps the A buffer resource scalar.
+                "x_bytes": fx.Int32(_TOKEN_REGION_END),
+            }
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
@@ -1146,7 +1206,7 @@ def compile_mega_moe_stage1(
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
             swiglu_limit=swiglu_limit,
             rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
-            lookahead=1,
+            lookahead=1, row_map=row_map,
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
@@ -1165,7 +1225,7 @@ def compile_mega_moe_stage1(
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
                 swiglu_limit=swiglu_limit,
                 rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
-                lookahead=1,
+                lookahead=1, row_map=row_map,
             )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
@@ -1210,6 +1270,10 @@ def compile_mega_moe_stage1(
         fx.barrier()
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
         num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
+        if const_expr(dedup_rows):
+            row_map["x_token"] = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[0]).ir_value()))
+            row_map["scale_token"] = fx.Int32(
+                rocdl.readfirstlane(T.i32, fx.Int32(token_offsets[1] // fx.Int64(16)).ir_value()))
         cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
@@ -1223,9 +1287,11 @@ def compile_mega_moe_stage1(
         # whole m-tile behind. GEMM2 of an m-tile reads its GEMM1 output from the L2 of the XCD that wrote it,
         # except in the m-tiles cut by a slice end (see _count_tile). Slice ends fall on groups of 4 n-tiles,
         # whose output scales fill whole 256-byte blocks: no cache line of GEMM1 output is written by two XCDs.
-        assert N_TILES % 4 == 0
-        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-4)
-        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-4)) - shard_base
+        # (2 n-tiles of tile_n 256 cover the same 256 output columns when N_TILES is not a multiple of 4.)
+        cut_tiles = 4 if N_TILES % 4 == 0 else 2
+        assert N_TILES % cut_tiles == 0 and tile_n * cut_tiles >= 512
+        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-cut_tiles)
+        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-cut_tiles)) - shard_base
 
         # The m-tiles at this XCD slice's ends that the slice cuts (-1: the end is on an m-tile boundary).
         shard_end = shard_base + shard_work
@@ -1381,7 +1447,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
-    b_nt=-1, swiglu_limit=0.0, preload=False):
+    b_nt=-1, swiglu_limit=0.0, dedup_rows=False, preload=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -1390,7 +1456,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         grid_mult=grid_mult, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
-        b_nt=b_nt, swiglu_limit=swiglu_limit,
+        b_nt=b_nt, swiglu_limit=swiglu_limit, dedup_rows=dedup_rows,
     )
     # preload: compile and load without dispatching (AOT bundles).
     (_preload_compiled if preload else _run_compiled)(
@@ -1418,6 +1484,8 @@ _HOT_EXPERT_MIN_ROWS = 256
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
+# dedup_rows: byte offset (from the payload / scale buffer base) that the token-row regions end below.
+_TOKEN_REGION_END = (1 << 31) - (1 << 16)
 
 
 def small_m_config(
@@ -1485,14 +1553,14 @@ class SmallMRuntime:
         from .mega_moe_v2 import small_m_eligible
 
         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
-        # work over 8 XCDs and bakes in the EP8 DeepSeek-V4 shape), instead of failing at compile.
+        # work over 8 XCDs and bakes in the FUSED_LAYOUTS shapes), instead of failing at compile.
         if not small_m_eligible(
             enabled=True, arch=get_gfx_runtime(),
             num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
             world_size=self.world_size, model_dim=self.model_dim, inter_dim=self.inter_dim,
             experts=self.experts, topk=self.topk, quant=quant, swiglu_limit=self.swiglu_limit,
         ):
-            raise ValueError("SmallMRuntime supports the EP8 DeepSeek-V4 a8w4 layout on 8-XCD gfx950 only")
+            raise ValueError("SmallMRuntime supports the fused a8w4 layouts on 8-XCD gfx950 only")
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.
         self._reducers = _COMBINE_REDUCERS
@@ -1549,6 +1617,26 @@ class SmallMRuntime:
         v = op._ll_views()
         self._s1_rx = v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
+        # Token-row regions of dedup_rows dispatch (a per-shape setting, the same for every bucket): GEMM1 reads them
+        # as u32 buffer offsets from the payload / scale bases. The offsets are the same on every rank, and so is the
+        # fallback to one row per route.
+        self._s1_token_offsets = (0, 0)
+        self._s1_dedup_ok = small_m_config(
+            1, self.mtpr, experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim
+        ).stage1.dedup_rows
+        if self._s1_dedup_ok:
+            token_rows = self.world_size * self.mtpr
+            self._s1_token_rows = op._sym((token_rows * op.row_bytes,), torch.int8)
+            self._s1_token_scales = op._sym((max(1, token_rows * op.scale_n_i32),), torch.int32)
+            ms.shmem_barrier_all()
+            self._s1_token_offsets = (
+                self._s1_token_rows.data_ptr() - op.rx_em.data_ptr(),
+                self._s1_token_scales.data_ptr() - op.scale_em.data_ptr(),
+            )
+            self._s1_dedup_ok = all(
+                0 <= off and off % 16 == 0 and off + t.numel() * t.element_size() <= _TOKEN_REGION_END
+                for off, t in zip(self._s1_token_offsets, (self._s1_token_rows, self._s1_token_scales))
+            )
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
@@ -1614,6 +1702,7 @@ class SmallMRuntime:
         table[DispatchSlot.FC_INP] = comb_op.shmem_comb_inp_tok.data_ptr()
         table[DispatchSlot.FC_OUT] = comb_op.shmem_comb_out_tok.data_ptr()
         table[DispatchSlot.FC_TRECV] = comb_op.total_recv.data_ptr()
+        table[DispatchSlot.TOKEN_ROWS], table[DispatchSlot.TOKEN_SCALES] = self._s1_token_offsets
         self._s1_disp_template = table
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
         self._s1_disp_by_w2[(self.w2.data_ptr(), self.w2_scale.data_ptr())] = self._s1_disp
@@ -1653,6 +1742,8 @@ class SmallMRuntime:
         config = small_m_config(
             tokens, self.mtpr, experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim
         )
+        if config.stage1.dedup_rows and not self._s1_dedup_ok:
+            config = replace(config, stage1=replace(config.stage1, dedup_rows=False))
         self._active_config = config
         return config
 
@@ -1678,7 +1769,8 @@ class SmallMRuntime:
             mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
-            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit, preload=preload)
+            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
+            dedup_rows=stage1.dedup_rows, preload=preload)
         # fmt: on
 
     def preload_aot_bundle(self):

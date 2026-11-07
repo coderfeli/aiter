@@ -118,7 +118,7 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
 
 def run(args):
     rank, world, device = _setup_dist()
-    net = NETWORKS["v4_pro"]
+    net = NETWORKS[args.network]
     experts, topk = net["experts"], net["topk"]
     local_experts = experts // world
     try:
@@ -153,7 +153,7 @@ def run(args):
         large_m = moe._large_m is not None
         if rank == 0:
             print(
-                f"[SETUP] mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} large_m={large_m} world={world}",
+                f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} large_m={large_m} world={world}",
                 flush=True,
             )
 
@@ -482,6 +482,23 @@ def run(args):
                     force_padding_boundary=False,
                 )
             bind(0, 0)
+            if args.check_time_acc:
+                # The timed paths against the fp32 reference, at the timed token count.
+                checks = [("large_m" if large_m else "main", lambda: moe(tx, tw, ti))]
+                if n <= moe.small_m_mtpr:
+                    checks.append(("small_m", lambda: moe.forward_small_m(tx, tw, ti, max_tokens=n)))
+                ref = _reference(tx, tw, ti, refw[0], rank, world, net["model_dim"], net["inter_dim"],
+                    experts, net["swiglu_limit"])
+                for label, fn in checks:
+                    out = fn()[:n].clone()
+                    _barrier()
+                    rel_ref = _rel_l2(out, ref)
+                    ok = rel_ref < args.rtol and _all_true(bool(torch.isfinite(out).all()), device)
+                    if rank == 0:
+                        print(f"[ACC-T] bs/rank={n} {label} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                            flush=True)
+                    if not ok:
+                        failures.append(f"time-acc {label} {n}")
             res = {}
             paths = [
                 (
@@ -552,6 +569,7 @@ def main():
         print(f"[SKIP] the small- and large-input paths need gfx950, got {get_gfx()}")
         return
     p = argparse.ArgumentParser()
+    p.add_argument("--network", choices=("v4_pro", "v41_flash"), default="v4_pro")
     p.add_argument("--mtpr", type=int, default=8192)
     p.add_argument("--slots", type=int, default=61)
     p.add_argument("--seed", type=int, default=7)
@@ -572,6 +590,7 @@ def main():
     )
     p.add_argument("--graph-bs", type=int, default=168)
     p.add_argument("--time-only", action="store_true")
+    p.add_argument("--check-time-acc", action="store_true", help="check each timed path against the reference")
     p.add_argument("--time-calls", type=int, default=50)
     p.add_argument("--time-trials", type=int, default=15)
     run(p.parse_args())

@@ -31,6 +31,10 @@ from .weights import check_bindable, contiguous_weights, weight_spec
 
 __all__ = ["MegaMoEV2"]
 
+# (world_size, model_dim, inter_dim, experts, topk) of the a8w4 layouts the fused single-kernel paths serve:
+# EP8 DeepSeek-V4 Pro and EP4 DeepSeek-V4.1 Flash.
+FUSED_LAYOUTS = frozenset({(8, 7168, 3072, 384, 6), (4, 5120, 2304, 384, 6)})
+
 
 def _small_m_mtprs(mtprs) -> tuple[int, ...]:
     """Small-input runtime MTPRs; each is an independent single-kernel instance."""
@@ -58,16 +62,11 @@ def large_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
+    """Whether the large-input path supports this layout (one of FUSED_LAYOUTS)."""
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
-        and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and experts // world_size == 48
-        and topk == 6
+        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
         and max_tok_per_rank == 8192
         and swiglu_limit == 10.0
@@ -91,7 +90,7 @@ def small_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
+    """Whether the small-input path supports this layout (one of FUSED_LAYOUTS).
 
     The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
@@ -100,11 +99,7 @@ def small_m_eligible(
         enabled
         and arch.split(":", 1)[0] == "gfx950"
         and num_cu == 256
-        and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and topk == 6
+        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
         and swiglu_limit == 10.0
         and act == "silu"
