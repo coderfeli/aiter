@@ -359,9 +359,58 @@ def emit_direct_fixed_slot_payload(
                 comm_ops.store_i32_system(remote_done, done_index, expected)
 
 
+def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
+    """Per-expert counts (one expert per lane and 64-expert chunk) and their tile scans; the scans carry across
+    chunks."""
+    num_chunks = (fz_epr + 63) // 64
+    chunks = []
+    for chunk in range_constexpr(num_chunks):
+        last_lane = min(63, fz_epr - chunk * 64 - 1)
+        expert = lane + fx.Int32(chunk * 64) if const_expr(chunk > 0) else lane
+        valid_expert = lane < fx.Int32(last_lane + 1)
+        safe_expert = valid_expert.select(expert, fx.Int32(0))
+        count = load_at(AddrBuffer(a_running), safe_expert, fx.Int32, 1, cache_modifier=count_cm)
+        count = valid_expert.select(count, fx.Int32(0))
+        overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
+        overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
+        chunk_overflow = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, last_lane))
+        overflow_count = chunk_overflow if const_expr(chunk == 0) else overflow_count + chunk_overflow
+        if const_expr(chunk == num_chunks - 1):
+            no_overflow = overflow_count == fx.Int32(0)
+        safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
+        num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+        inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
+        metadata_base = inclusive_tiles - num_expert_tiles
+        chunk_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, last_lane))
+        chunk_rows = fx.Int32(fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), last_lane))
+        chunk_max = _wave_reduce_max_i32(safe_count, lane)
+        if const_expr(chunk == 0):
+            total_tiles, routed_rows, max_count = chunk_tiles, chunk_rows, chunk_max
+        else:
+            metadata_base = metadata_base + total_tiles
+            total_tiles = total_tiles + chunk_tiles
+            routed_rows = routed_rows + chunk_rows
+            max_count = (chunk_max > max_count).select(chunk_max, max_count)
+        chunks.append((valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base))
+    return chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow
+
+
+def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m):
+    """Low 32 bits of the plan word: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT /
+    _PLAN_FP8_ROWS_BIT."""
+    nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
+    nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
+        fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
+    )
+    return nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+        fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
+    )
+
+
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
+    plan_wt=False, keep_running=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -381,6 +430,7 @@ def emit_direct_fixed_slot_finalize(
     a_running = dp(DispatchSlot.RUNNING)
     a_source_done = dp(DispatchSlot.COUNT_DONE)
     a_tile_rows = dp(DispatchSlot.TILE_ROWS)
+    wt_cm = _SC0_SC1_CACHE if plan_wt else 0
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -391,37 +441,8 @@ def emit_direct_fixed_slot_finalize(
             comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
 
-        # One expert per lane and 64-expert chunk; the scans carry across chunks.
-        num_chunks = (fz_epr + 63) // 64
-        chunks = []
-        for chunk in range_constexpr(num_chunks):
-            last_lane = min(63, fz_epr - chunk * 64 - 1)
-            expert = lane + fx.Int32(chunk * 64) if const_expr(chunk > 0) else lane
-            valid_expert = lane < fx.Int32(last_lane + 1)
-            safe_expert = valid_expert.select(expert, fx.Int32(0))
-            count = load_at(AddrBuffer(a_running), safe_expert, fx.Int32, 1)
-            count = valid_expert.select(count, fx.Int32(0))
-            overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
-            overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
-            chunk_overflow = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, last_lane))
-            overflow_count = chunk_overflow if const_expr(chunk == 0) else overflow_count + chunk_overflow
-            if const_expr(chunk == num_chunks - 1):
-                no_overflow = overflow_count == fx.Int32(0)
-            safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
-            num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-            inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
-            metadata_base = inclusive_tiles - num_expert_tiles
-            chunk_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, last_lane))
-            chunk_rows = fx.Int32(fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), last_lane))
-            chunk_max = _wave_reduce_max_i32(safe_count, lane)
-            if const_expr(chunk == 0):
-                total_tiles, routed_rows, max_count = chunk_tiles, chunk_rows, chunk_max
-            else:
-                metadata_base = metadata_base + total_tiles
-                total_tiles = total_tiles + chunk_tiles
-                routed_rows = routed_rows + chunk_rows
-                max_count = (chunk_max > max_count).select(chunk_max, max_count)
-            chunks.append((valid_expert, safe_expert, safe_count, num_expert_tiles, metadata_base))
+        chunks, total_tiles, routed_rows, max_count, overflow_count, no_overflow = _plan_counts(
+            a_running, lane, fz_epr, fz_cap, fz_tile_m)
         hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
 
         for chunk in range_constexpr(len(chunks)):
@@ -432,30 +453,26 @@ def emit_direct_fixed_slot_finalize(
                     payload_base = safe_expert * fx.Int32(fz_cap)
                     for tile in range(fx.Int32(0), num_expert_tiles, 1):
                         metadata_index = metadata_base + tile
-                        store_at(global_expert, AddrBuffer(a_se), metadata_index)
-                        store_at(payload_base + tile * fx.Int32(fz_tile_m), AddrBuffer(a_trb), metadata_index)
+                        store_at(global_expert, AddrBuffer(a_se), metadata_index, cache_modifier=wt_cm)
+                        store_at(payload_base + tile * fx.Int32(fz_tile_m), AddrBuffer(a_trb), metadata_index,
+                            cache_modifier=wt_cm)
                         rows = safe_count - tile * fx.Int32(fz_tile_m)
                         rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
-                        store_at(rows, AddrBuffer(a_tile_rows), metadata_index)
-                store_at(fx.Int32(0), AddrBuffer(a_running), safe_expert)
+                        store_at(rows, AddrBuffer(a_tile_rows), metadata_index, cache_modifier=wt_cm)
+                if const_expr(not keep_running):
+                    store_at(fx.Int32(0), AddrBuffer(a_running), safe_expert, cache_modifier=wt_cm)
 
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            store_at(num_valid, AddrBuffer(a_nv), fx.Int32(0))
+            store_at(num_valid, AddrBuffer(a_nv), fx.Int32(0), cache_modifier=wt_cm)
             # num_valid[1] is a device-visible overflow status.
-            store_at(overflow_count, AddrBuffer(a_nv), fx.Int32(1))
+            store_at(overflow_count, AddrBuffer(a_nv), fx.Int32(1), cache_modifier=wt_cm)
 
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        comm_ops.fence_system_release()
+        if const_expr(not plan_wt):
+            comm_ops.fence_system_release()
         if lane == fx.Int32(0):
-            # Low 32 bits: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT / _PLAN_FP8_ROWS_BIT.
-            nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
-                fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
-            )
-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
-                fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
-            )
+            nv_flag = _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m)
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -678,13 +695,15 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
 
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
-    flag_is_value=False, l1_acquire=False, row_format=False):
+    flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
     of a counter the last WG advances.
     ``l1_acquire``: the reducers acquire the peers' rows by dropping only the CU's L1. Valid when the combine input
     lives in the uncached shmem heap (never held in L2) and the local rows were released by the last WG.
+    ``reset_running``: the last WG zeroes the first reset_running expert counts at ``arg_running`` before it
+    publishes (every CTA read them before its ticket; the peers' next producers add to them only after the flag).
     ``row_format``: each rank sent its rows as BF16 or FP8 (1x32 E8M0 scales after the values, BF16 row stride),
     as ``i32_fp8_rows`` says; the choice travels as the low bit of the published flag.
 
@@ -700,7 +719,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     @flyc.jit
     def fused_combine_tail(tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, arg_cnt: fx.Int64, arg_flag: fx.Int64,
         arg_xdb: fx.Int64, arg_p2p_xdb: fx.Int64, arg_inp: fx.Int64, arg_out: fx.Int64, arg_trecv: fx.Int64,
-        arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32):
+        arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32, arg_running: fx.Int64):
     # fmt: on
         ticket_ptr = lds_typed_ptr(fx.Int32(lds_fc_off), T.i32, align=4)
         flag_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 8), T.i64, align=8)
@@ -729,6 +748,11 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
         ticket = rocdl.readfirstlane(T.i32, fx.ptr_load(ticket_ptr).ir_value())
         flag = fx.ptr_load(flag_ptr)
         if fx.Int32(ticket) == last:
+            if const_expr(reset_running > 0):
+                if tx_i32 < fx.Int32(reset_running):
+                    store_at(fx.Int32(0), AddrBuffer(arg_running), tx_i32, cache_modifier=_SC0_SC1_CACHE)
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                fx.barrier()
             if tx_i32 < fx.Int32(npes):
                 # Every other WG's stores completed before its ticket; acquire them, then publish to peer tx.
                 comm_ops.fence_system_acquire()
@@ -908,7 +932,8 @@ def compile_mega_moe_stage1(
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
-    swiglu_limit: float = 0.0, dedup_rows: bool = False,
+    swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_direct: bool = False, plan_wt: bool = False,
+    plan_local: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1003,7 +1028,8 @@ def compile_mega_moe_stage1(
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
-        experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True)
+        experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
+        reset_running=fz_epr if plan_local else 0)
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
@@ -1025,6 +1051,8 @@ def compile_mega_moe_stage1(
     entry_unit = 2 * num_cu
     assert launch_grid_x * entry_inc == entry_unit
 
+    plan_chunks = (fz_epr + 63) // 64
+
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
@@ -1032,6 +1060,9 @@ def compile_mega_moe_stage1(
         # Work-unit broadcast word, kept out of the pool: a fast wave's next A / C-shuffle store must not race the
         # slower waves' read of the unit it starts.
         work_word: fx.Array[fx.Int8, 16, 16]
+        if plan_local:
+            # Per expert slot (64-expert chunks): its inclusive tile count, then its row count.
+            plan_tab: fx.Array[fx.Int8, plan_chunks * 64 * 8, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -1043,6 +1074,9 @@ def compile_mega_moe_stage1(
         f"{swiglu_suffix}"
         f"_fused{'_'.join(str(v) for v in fused)}"
         f"{'_dd' if dedup_rows else ''}"
+        f"{'_pd' if plan_direct else ''}"
+        f"{'_pw' if plan_wt else ''}"
+        f"{'_pl' if plan_local else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -1166,6 +1200,7 @@ def compile_mega_moe_stage1(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
+                plan_wt=plan_wt, keep_running=plan_local,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1192,6 +1227,30 @@ def compile_mega_moe_stage1(
                 # A constant bound keeps the A buffer resource scalar.
                 "x_bytes": fx.Int32(_TOKEN_REGION_END),
             }
+        plan_lookup = None
+        if const_expr(plan_local):
+            plan_tab_base = fx.Int32(fx.ptrtoint(lds.plan_tab.ptr))
+
+            def plan_lookup(m_tile):
+                # The tile's expert = the experts whose inclusive tile count is <= m_tile.
+                lane = tid & fx.Int32(63)
+                expert = fx.Int32(0)
+                for chunk in range_constexpr(plan_chunks):
+                    incl = fx.ptr_load(lds_typed_ptr(plan_tab_base + (fx.Int32(chunk * 64) + lane) * fx.Int32(4),
+                        T.i32, align=4), result_type=T.i32)
+                    mask = rocdl.ballot(T.i64, fx.Int32(incl) <= m_tile)
+                    expert = expert + fx.Int32(fx.Int64(fx.math.ctpop(mask)))
+                expert = fx.Int32(rocdl.readfirstlane(T.i32, expert.ir_value()))
+                incl_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
+                    plan_tab_base + expert * fx.Int32(4), T.i32, align=4), result_type=T.i32)))
+                count_e = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
+                    plan_tab_base + fx.Int32(plan_chunks * 256) + expert * fx.Int32(4), T.i32, align=4),
+                    result_type=T.i32)))
+                tiles_e = (count_e + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+                tile_rows_base = (m_tile - incl_e + tiles_e) * fx.Int32(fz_tile_m)
+                rows = count_e - tile_rows_base
+                rows = (rows < fx.Int32(fz_tile_m)).select(rows, fx.Int32(fz_tile_m))
+                return expert, expert * fx.Int32(fz_cap) + tile_rows_base, rows
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
@@ -1206,7 +1265,7 @@ def compile_mega_moe_stage1(
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
             swiglu_limit=swiglu_limit,
             rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
-            lookahead=1, row_map=row_map,
+            lookahead=1, row_map=row_map, plan_lookup=plan_lookup,
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
@@ -1225,7 +1284,7 @@ def compile_mega_moe_stage1(
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
                 swiglu_limit=swiglu_limit,
                 rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
-                lookahead=1, row_map=row_map,
+                lookahead=1, row_map=row_map, plan_lookup=plan_lookup,
             )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
@@ -1250,23 +1309,54 @@ def compile_mega_moe_stage1(
 
         first_local = fx.Int32(0)
         nv_ptr = lds_typed_ptr(fx.Int32(g2_scratch_off + 4), T.i32, align=4)
+
+        def _local_plan():
+            # Wave 0: wait for every source as the plan CTA does, then build this CTA's plan table in LDS. The
+            # counts are final once the sources are done; they are read past L2 (the last WG of the previous
+            # launch zeroed them). Returns the plan word's low half.
+            lane = tid & fx.Int32(63)
+            a_done = _disp_ptr(DispatchSlot.COUNT_DONE)
+            for source in range(lane, fz_npes, 64):
+                done_index = payload_parity * fx.Int32(fz_npes) + source
+                comm_ops.wait_i32_until_equals(a_done + fx.Int64(done_index) * fx.Int64(4), payload_expected)
+            comm_ops.invalidate_l1()
+            chunks, total_tiles, routed_rows, max_count, _overflow, no_overflow = _plan_counts(
+                _disp_ptr(DispatchSlot.RUNNING), lane, fz_epr, fz_cap, fz_tile_m, count_cm=_SC0_SC1_CACHE)
+            for chunk in range_constexpr(plan_chunks):
+                _valid, _expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
+                slot = (fx.Int32(chunk * 64) + lane) * fx.Int32(4)
+                fx.ptr_store(metadata_base + num_expert_tiles, lds_typed_ptr(plan_tab_base + slot, T.i32, align=4))
+                fx.ptr_store(safe_count, lds_typed_ptr(plan_tab_base + fx.Int32(plan_chunks * 256) + slot, T.i32,
+                    align=4))
+            hot_expert = max_count >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
+            return _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m)
         if tid == fx.Int32(0):
             xcd = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
             # The owner reset the counters before opening the gate: the first work fetch overlaps the plan wait.
             first_local = fx.Int32(
                 comm_ops.atomic_add_agent(a_work_head + fx.Int64(xcd) * fx.Int64(64), fx.Int32(1)))
-            a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
-            plan_word = fx.Int64(0)
-            # Match this launch's epoch in the high word exactly: a >= wait breaks when the 32-bit epoch wraps.
-            if first_local == fx.Int32(0):
-                plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
-                    _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
-                comm_ops.fence_agent_acquire()
-                comm_ops.store_i64_global_system(a_xcd_acq, plan_word)
-            else:
-                plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(a_xcd_acq, gate_epoch, shift=32))
-                comm_ops.invalidate_l1()
-            fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
+            if const_expr(not plan_local):
+                a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
+                plan_word = fx.Int64(0)
+                # Match this launch's epoch in the high word exactly: a >= wait breaks when the 32-bit epoch wraps.
+                if const_expr(plan_direct):
+                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
+                        _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
+                    comm_ops.invalidate_l1()
+                elif first_local == fx.Int32(0):
+                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
+                        _disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32))
+                    comm_ops.fence_agent_acquire()
+                    comm_ops.store_i64_global_system(a_xcd_acq, plan_word)
+                else:
+                    plan_word = fx.Int64(comm_ops.spin_until_shifted_eq_i64(a_xcd_acq, gate_epoch, shift=32))
+                    comm_ops.invalidate_l1()
+                fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
+        if const_expr(plan_local):
+            if tid < fx.Int32(64):
+                plan_low_local = _local_plan()
+                if tid == fx.Int32(0):
+                    fx.ptr_store(plan_low_local, nv_ptr)
         fx.barrier()
         plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
         num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
@@ -1382,6 +1472,10 @@ def compile_mega_moe_stage1(
         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
+        if const_expr(plan_local):
+            # GEMM2 reads the plan CTA's metadata (its first unit drops the L1 after its ready wait).
+            if tid == fx.Int32(0):
+                comm_ops.spin_until_shifted_eq_i64(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch, shift=32)
         while g2_active:
             fx.barrier()
             if tid == fx.Int32(0):
@@ -1418,7 +1512,8 @@ def compile_mega_moe_stage1(
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
-            fx.Int32(launch_grid_x), fp8_rows)
+            fx.Int32(launch_grid_x), fp8_rows,
+            _disp_ptr(DispatchSlot.RUNNING) if const_expr(plan_local) else fx.Int64(0))
 
     @flyc.jit
     def launch(
@@ -1447,7 +1542,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
-    b_nt=-1, swiglu_limit=0.0, dedup_rows=False, preload=False):
+    b_nt=-1, swiglu_limit=0.0, dedup_rows=False, plan_direct=False, plan_wt=False, plan_local=False,
+    preload=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -1456,7 +1552,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         grid_mult=grid_mult, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
-        b_nt=b_nt, swiglu_limit=swiglu_limit, dedup_rows=dedup_rows,
+        b_nt=b_nt, swiglu_limit=swiglu_limit, dedup_rows=dedup_rows, plan_direct=plan_direct,
+        plan_wt=plan_wt, plan_local=plan_local,
     )
     # preload: compile and load without dispatching (AOT bundles).
     (_preload_compiled if preload else _run_compiled)(
@@ -1770,7 +1867,8 @@ class SmallMRuntime:
             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
             use_tile_resource=stage1.use_tile_resource,
             waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
-            dedup_rows=stage1.dedup_rows, preload=preload)
+            dedup_rows=stage1.dedup_rows, plan_direct=stage1.plan_direct, plan_wt=stage1.plan_wt,
+            plan_local=stage1.plan_local, preload=preload)
         # fmt: on
 
     def preload_aot_bundle(self):
