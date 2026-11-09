@@ -318,16 +318,6 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
-def store_i64_global_system_monotonic(addr_i64, val):
-    """System-visible monotonic i64 store to ``addr_i64`` (no release fence)."""
-    fx.generic_store(
-        _to_ptr_global(addr_i64, fx.Int64, 8),
-        fx.Int64(val),
-        memory_order=fx.AtomicOrdering.Monotonic,
-        syncscope="one-as",
-    )
-
-
 def store_i64_global(addr_i64, val):
     """Plain (non-atomic) global i64 store to ``addr_i64``."""
     fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))

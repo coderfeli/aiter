@@ -118,10 +118,6 @@ class Stage1Config:
     # the destination, whose combine reduces a token once its counter reaches valid routes x GEMM2 n-blocks instead
     # of after every rank's grid ticket and flag (BF16 rows; the flags stay as the fallback).
     tok_done: bool = False
-    # Small-input fused kernel: the combine polls its tokens' BF16 rows for the poison words every reducer leaves
-    # in the first _BF16_TOKENS tokens' rows, and sums them once none is left (no sender drain or counter; the
-    # flags stay as the fallback).
-    row_poll: bool = False
     # Large-input GEMM1: m-tiles with at most this many real rows (an expert's padded tail) run a
     # short_tail_rows-row tile (0: every m-tile runs sort_block_m rows).
     short_tail_rows: int = 0

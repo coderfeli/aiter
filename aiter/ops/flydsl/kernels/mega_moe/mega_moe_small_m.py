@@ -754,7 +754,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
             @flyc.jit
             def store_dynamic():
-                if (fp8_rows != fx.Int32(0)) & (dest_lid >= fx.Int32(_BF16_TOKENS)):
+                if fp8_rows != fx.Int32(0):
                     _store_fp8()
                 else:
                     _store_bf16(weighted_v8.to(fx.BFloat16))
@@ -782,7 +782,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False, reset_running=0, reset_tok=0, tok_done=False,
-    n_blocks=1, row_poll=False):
+    n_blocks=1):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
@@ -797,8 +797,6 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     launch's tok_done half: every add to it landed before that launch's reduce).
     ``tok_done``: a reducer takes a token once its counter at ``arg_inp + arg_tok_off`` reaches its valid routes x
     ``n_blocks`` (every sender then counted BF16 rows), or once every peer's flag is in.
-    ``row_poll`` (at most _BF16_TOKENS tokens): a reducer sums its rows once none of their words is still the
-    poison every reducer leaves there, or once every peer's flag is in.
 
     Matches ep_combine_intranode(skip_stage1=True, bf16): out[t] = bf16(sum_k f32(inp[t * topk + k])), where an
     invalid (-1) slot ``k`` of ``idx`` contributes zero.
@@ -807,7 +805,6 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     chunks = row_i32 // 256
     assert row_i32 % 256 == 0
     assert flag_is_value or not row_format
-    assert not (tok_done and row_poll)
 
     # fmt: off
     @flyc.jit
@@ -824,10 +821,6 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
             return lds_typed_ptr(fx.Int32(lds_fc_off + 16) + peer * fx.Int32(4), T.i32, align=4)
 
         last = i32_grid - fx.Int32(1)
-        remote_pre = fx.Int64(0)
-        if const_expr(row_poll and not int(__import__('os').environ.get('RP_OLDPUB', '0'))):
-            if tx_i32 < fx.Int32(npes):
-                remote_pre = fx.Int64(load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1))
         # Every wave waits for its own P2P stores before the WG takes its ticket.
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         fx.barrier()
@@ -853,17 +846,11 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                 rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 fx.barrier()
             if tx_i32 < fx.Int32(npes):
-                if const_expr(row_poll and not int(__import__('os').environ.get('RP_OLDPUB', '0'))):
-                    # Every WG's rows reached the uncached heap before its ticket and the resets above were
-                    # written through and drained: the flag store needs no fences (it ends the kernel here).
-                    rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    comm_ops.store_i64_global_system_monotonic(remote_pre + fx.Int64(rank * 8), flag)
-                else:
-                    # Every other WG's stores completed before its ticket; acquire them, then publish to peer tx.
-                    comm_ops.fence_system_acquire()
-                    comm_ops.fence_system_release()
-                    remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
-                    comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
+                # Every other WG's stores completed before its ticket; acquire them, then publish to peer tx.
+                comm_ops.fence_system_acquire()
+                comm_ops.fence_system_release()
+                remote = load_at(AddrBuffer(arg_p2p_xdb), tx_i32, fx.Int64, 1)
+                comm_ops.store_i64_global_system(fx.Int64(remote) + fx.Int64(rank * 8), flag)
             fx.barrier()
             if tx_i32 == fx.Int32(0):
                 if const_expr(not flag_is_value):
@@ -879,7 +866,7 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
         first = i32_grid - nred
         if fx.Int32(ticket) >= first:
             # tok_done: each reducer wave waits for its own token below instead.
-            if tx_i32 < fx.Int32(0 if tok_done or (row_poll and not int(__import__('os').environ.get('RP_WGWAIT', '0'))) else npes):
+            if tx_i32 < fx.Int32(0 if tok_done else npes):
                 if const_expr(row_format):
                     # This launch's flag with either format bit (flag << 1 | fp8).
                     seen = fx.Int64(comm_ops.spin_until_shifted_eq_i64(
@@ -893,10 +880,10 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                     comm_ops.fence_system_acquire()
             fx.barrier()
             fp8_peers = fx.Int32(0)
-            if const_expr(row_format and not tok_done and not row_poll):
+            if const_expr(row_format and not tok_done):
                 for peer in range_constexpr(npes):
                     fp8_peers = fp8_peers | fx.Int32(fx.ptr_load(fmt_ptr(fx.Int32(peer)), result_type=T.i32))
-            inp_rsrc = AddrBuffer(_uniform_i64(arg_inp) if const_expr(row_poll) else arg_inp)
+            inp_rsrc = AddrBuffer(arg_inp)
             idx_rsrc = AddrBuffer(arg_idx)
             out_rsrc = AddrBuffer(arg_out)
             items = i32_cur_tok * fx.Int32(chunks)
@@ -932,99 +919,45 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
                         fbits = flag_bits()
                     fp8_peers = (cnt == target).select(fx.Int32(0), fbits & fx.Int32((1 << npes) - 1))
                     comm_ops.invalidate_l1()
-                # The first tokens' rows are BF16 from every sender.
-                fp8_tok = (tok < fx.Int32(_BF16_TOKENS)).select(fx.Int32(0), fp8_peers)
-                if const_expr(row_poll):
-                    poison = fx.Int32(_ROW_POISON)
-
-                    def rows_in():
-                        # Every route's 4 words_p in one vector, and how many words_p of the valid_p routes are poison.
-                        words_p = []
-                        miss = fx.Int32(0)
-                        for k in range_constexpr(topk):
-                            valid_p = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
-                            wk_p = fx.Vector(load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, int(__import__('os').environ.get('RP_CM', '17'))))
-                            for w in range_constexpr(4):
-                                words_p.append(wk_p[w])
-                                miss = miss + (valid_p & (fx.Int32(wk_p[w]) == poison)).select(fx.Int32(1), fx.Int32(0))
-                        if const_expr(int(__import__('os').environ.get('RP_NOPOLL', '0'))):
-                            miss = miss + fx.Int32(1)
-                        return fx.Vector.from_elements(words_p, fx.Int32), miss
-
-                    def flags_in():
-                        seen_all = fx.Int32(1)
-                        for peer in range_constexpr(npes):
-                            seen = fx.Int64(comm_ops.load_i64_acquire(arg_xdb + fx.Int64(peer * 8)))
-                            seen_all = seen_all & ((seen >> fx.Int64(1)) == arg_flag).select(fx.Int32(1), fx.Int32(0))
-                        return seen_all
-
-                    rows, miss = rows_in()
-                    fdone = fx.Int32(0)
-                    while (miss != fx.Int32(0)) & (fdone == fx.Int32(0)):
-                        fdone = flags_in()
-                        rows, miss = rows_in()
-                    # Ended on the flags: the rows loaded beside the flag check may predate it; load them once more.
-                    while miss != fx.Int32(0):
-                        rows, _ = rows_in()
-                        miss = fx.Int32(0)
-                    acc_p = Vec.filled(8, 0.0, fx.Float32)
+                if fp8_peers == fx.Int32(0):
+                    vals = [load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2) for k in range_constexpr(topk)]
+                    acc = Vec.filled(8, 0.0, fx.Float32)
                     for k in range_constexpr(topk):
-                        valid_p = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
-                        words_p = fx.Vector.from_elements(
-                            [valid_p.select(rows[k * 4 + w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
+                        valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
+                        words = fx.Vector(vals[k])
+                        words = fx.Vector.from_elements(
+                            [valid.select(words[w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
                         )
-                        acc_p = acc_p + words_p.bitcast(fx.BFloat16).to(fx.Float32)
-                    store_at(acc_p.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
-                    for k in range_constexpr(topk):
-                        store_at(Vec.filled(4, _ROW_POISON, fx.Int32).ir_value(), inp_rsrc, src + fx.Int32(k * row_i32))
+                        acc = acc + words.bitcast(fx.BFloat16).to(fx.Float32)
+                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
                 else:
-                    if fp8_tok == fx.Int32(0):
-                        vals = [load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2) for k in range_constexpr(topk)]
-                        acc = Vec.filled(8, 0.0, fx.Float32)
-                        for k in range_constexpr(topk):
-                            valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
-                            words = fx.Vector(vals[k])
-                            words = fx.Vector.from_elements(
-                                [valid.select(words[w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
-                            )
-                            acc = acc + words.bitcast(fx.BFloat16).to(fx.Float32)
-                        store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
-                        if tok < fx.Int32(_BF16_TOKENS):
-                            for k in range_constexpr(topk):
-                                store_at(Vec.filled(4, _ROW_POISON, fx.Int32).ir_value(), inp_rsrc,
-                                    src + fx.Int32(k * row_i32))
-                    else:
-                        # Some peer sent FP8 rows: the lane's 8 values are 2 i32 of its FP8 row (byte col * 2) plus the
-                        # scale byte of their 32-value block.
-                        acc = Vec.filled(8, 0.0, fx.Float32)
-                        sc_byte = col // fx.Int32(16)
-                        for k in range_constexpr(topk):
-                            valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
-                            peer = valid.select(eids[k], fx.Int32(0)) // fx.Int32(experts_per_rank)
-                            row_k = src - col + fx.Int32(k * row_i32)
-                            contrib = Vec.filled(8, 0.0, fx.Float32)
-                            if valid:
-                                if ((fp8_tok >> peer) & fx.Int32(1)) != fx.Int32(0):
-                                    words = fx.Vector(load_at(inp_rsrc, row_k + col // fx.Int32(2), fx.Int32, 2, 2))
-                                    sc_word = load_at(inp_rsrc, row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4),
-                                        fx.Int32, 1, 2)
-                                    e8m0 = (sc_word >> ((sc_byte & fx.Int32(3)) * fx.Int32(8))) & fx.Int32(0xFF)
-                                    scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-                                    quads = []
-                                    for w in range_constexpr(2):
-                                        lo = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=False)
-                                        hi = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=True)
-                                        quads.append(lo.shuffle(hi, [0, 1, 2, 3]) * scale)
-                                    contrib = quads[0].shuffle(quads[1], [0, 1, 2, 3, 4, 5, 6, 7])
-                                else:
-                                    words = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, 2))
-                                    contrib = words.bitcast(fx.BFloat16).to(fx.Float32)
-                            acc = acc + contrib
-                        store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
-        if const_expr(row_poll and int(__import__('os').environ.get('RP_ENDWAIT', '0'))):
-            if fx.Int32(ticket) == last:
-                if tx_i32 < fx.Int32(npes):
-                    comm_ops.spin_until_shifted_eq_i64(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag, shift=1)
+                    # Some peer sent FP8 rows: the lane's 8 values are 2 i32 of its FP8 row (byte col * 2) plus the
+                    # scale byte of their 32-value block.
+                    acc = Vec.filled(8, 0.0, fx.Float32)
+                    sc_byte = col // fx.Int32(16)
+                    for k in range_constexpr(topk):
+                        valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
+                        peer = valid.select(eids[k], fx.Int32(0)) // fx.Int32(experts_per_rank)
+                        row_k = src - col + fx.Int32(k * row_i32)
+                        contrib = Vec.filled(8, 0.0, fx.Float32)
+                        if valid:
+                            if ((fp8_peers >> peer) & fx.Int32(1)) != fx.Int32(0):
+                                words = fx.Vector(load_at(inp_rsrc, row_k + col // fx.Int32(2), fx.Int32, 2, 2))
+                                sc_word = load_at(inp_rsrc, row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4),
+                                    fx.Int32, 1, 2)
+                                e8m0 = (sc_word >> ((sc_byte & fx.Int32(3)) * fx.Int32(8))) & fx.Int32(0xFF)
+                                scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+                                quads = []
+                                for w in range_constexpr(2):
+                                    lo = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=False)
+                                    hi = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=True)
+                                    quads.append(lo.shuffle(hi, [0, 1, 2, 3]) * scale)
+                                contrib = quads[0].shuffle(quads[1], [0, 1, 2, 3, 4, 5, 6, 7])
+                            else:
+                                words = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, 2))
+                                contrib = words.bitcast(fx.BFloat16).to(fx.Float32)
+                        acc = acc + contrib
+                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
 
     return fused_combine_tail
 
@@ -1132,7 +1065,7 @@ def compile_mega_moe_stage1(
     swiglu_limit: float = 0.0, dedup_rows: bool = False, plan_direct: bool = False, plan_wt: bool = False,
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
-    row_poll: bool = False, epi_evec: int = 2, epi_lean: int = 0, ascale_packed: bool = False,
+    epi_evec: int = 2, epi_lean: int = 0, ascale_packed: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1231,8 +1164,7 @@ def compile_mega_moe_stage1(
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
         npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
         experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True,
-        reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr, tok_done=tok_done, n_blocks=g2_n_blocks,
-        row_poll=row_poll)
+        reset_running=fz_epr if plan_local else 0, reset_tok=fz_mtpr, tok_done=tok_done, n_blocks=g2_n_blocks)
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
@@ -1289,7 +1221,7 @@ def compile_mega_moe_stage1(
         f"{'_g2u' if g2_uniform else ''}{f'_g2l{g2_epi_lean}' if g2_epi_lean else ''}"
         f"{'_hu' if head_uniform else ''}{f'_la{g1_lookahead}' if g1_lookahead != 1 else ''}"
         f"{f'_ga{g1_a_ahead}' if g1_a_ahead != 1 else ''}{f'_dn{direct_done}' if direct_done else ''}"
-        f"{'_td' if tok_done else ''}{'_rp' if row_poll else ''}"
+        f"{'_td' if tok_done else ''}"
         f"{f'_ev{epi_evec}' if epi_evec != 2 else ''}{f'_el{epi_lean}' if epi_lean else ''}"
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
@@ -1793,7 +1725,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, swiglu_limit=0.0, dedup_rows=False, plan_direct=False, plan_wt=False, plan_local=False,
     g2_early=(0, 0), g2_uniform=False, head_uniform=False, g2_epi_lean=0, g1_lookahead=1, g1_a_ahead=1, direct_done=0,
-    tok_done=False, row_poll=False, epi_evec=2,
+    tok_done=False, epi_evec=2,
     epi_lean=0, ascale_packed=False,
     preload=False):
     launch = compile_mega_moe_stage1(
@@ -1807,7 +1739,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, swiglu_limit=swiglu_limit, dedup_rows=dedup_rows, plan_direct=plan_direct,
         plan_wt=plan_wt, plan_local=plan_local, g2_early=tuple(g2_early), g2_uniform=g2_uniform,
         head_uniform=head_uniform, g2_epi_lean=g2_epi_lean, g1_lookahead=g1_lookahead, g1_a_ahead=g1_a_ahead,
-        direct_done=direct_done, tok_done=tok_done, row_poll=row_poll,
+        direct_done=direct_done, tok_done=tok_done,
         epi_evec=epi_evec, epi_lean=epi_lean, ascale_packed=ascale_packed,
     )
     # preload: compile and load without dispatching (AOT bundles).
@@ -1836,10 +1768,6 @@ _HOT_EXPERT_MIN_ROWS = 256
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
-# Tokens whose GEMM2 rows are always BF16, and whose combine-input rows every reducer re-poisons (all words
-# _ROW_POISON) after summing them: row_poll reducers (at most this many tokens) poll those rows themselves.
-_BF16_TOKENS = 4
-_ROW_POISON = -1
 # dedup_rows: byte offset (from the payload / scale buffer base) that the token-row regions end below.
 _TOKEN_REGION_END = (1 << 31) - (1 << 16)
 
@@ -2020,10 +1948,6 @@ class SmallMRuntime:
         }
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
         workspace["tok_done"] = op._sym((2 * self.mtpr,), torch.int32)
-        # The first tokens' combine-input rows start poisoned (see _BF16_TOKENS).
-        first_rows = self.comb_op.shmem_comb_inp_tok.view(torch.int32)
-        first_rows[: min(_BF16_TOKENS, self.mtpr) * self.topk * self.model_dim // 2].fill_(_ROW_POISON)
-        torch.cuda.synchronize()
         ms.shmem_barrier_all()
         workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
         self._s1_dispatch_workspace = workspace
@@ -2143,7 +2067,7 @@ class SmallMRuntime:
             plan_local=stage1.plan_local, g2_early=(stage2.early_k, stage2.early_p if stage2.early_k else 0),
             g2_uniform=stage1.g2_uniform, head_uniform=stage1.head_uniform, g2_epi_lean=stage1.g2_epi_lean,
             g1_lookahead=stage1.g1_lookahead, g1_a_ahead=stage1.g1_a_ahead, direct_done=stage1.direct_done,
-            tok_done=stage1.tok_done, row_poll=stage1.row_poll, epi_evec=stage1.epi_evec,
+            tok_done=stage1.tok_done, epi_evec=stage1.epi_evec,
             epi_lean=stage1.epi_lean, ascale_packed=stage1.ascale_packed, preload=preload)
         # fmt: on
 
