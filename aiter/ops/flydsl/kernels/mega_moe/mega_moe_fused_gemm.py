@@ -3,12 +3,14 @@
 """GEMM1/GEMM2 tiles, buffer helpers and launch configs shared by the MegaMoEV2 small- and large-input kernels."""
 
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float4E2M1FN,
@@ -31,6 +33,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
+from ..dpp_utils import dpp_xor_f32
 from ..tensor_shim import _fx_value_elem, buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 TOKEN_BUCKETS = (
@@ -75,6 +78,113 @@ class Stage1Config:
     swizzle_a: bool = True
     work_shards: int = 8
     payload_chunk_rows: int = 0
+    # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
+    payload_min_blocks: int = 0
+    # With payload_min_blocks: a rank with at most payload_small_tokens tokens gives each destination at least
+    # payload_small_blocks producers instead (0: off).
+    payload_small_blocks: int = 0
+    payload_small_tokens: int = 0
+    # One dispatch row per (token, destination rank) instead of per route; GEMM1 reads A through the srcmap.
+    # Every rank of a launch must agree.
+    dedup_rows: bool = False
+    # Small-input fused kernel: every CTA waits on the plan flag itself and invalidates only its L1, instead of one
+    # CTA an XCD acquiring and republishing the flag. No CTA reads the plan, srcmap or token rows before the flag, so
+    # its XCD's L2 holds none of their lines (the launch's acquire dropped the earlier ones).
+    plan_direct: bool = False
+    # Small-input fused kernel: the plan CTA writes the plan through to memory, so it publishes the flag without an L2
+    # writeback first.
+    plan_wt: bool = False
+    # Small-input fused kernel: every CTA waits for the sources itself and builds the plan from the expert counts
+    # in its LDS; GEMM1 takes its tiles from there, and only GEMM2 reads the plan CTA's metadata.
+    plan_local: bool = False
+    # Small-input fused kernel: GEMM2 moves its dispatch-table pointers into SGPRs, so its buffer loads need no
+    # readfirstlane waterfall loop.
+    g2_uniform: bool = False
+    # Small-input fused kernel: the dispatch-table and remote pointers of the head (producers, plan finalize,
+    # kernel entry) in SGPRs, for the same reason.
+    head_uniform: bool = False
+    # Small-input fused kernel: the GEMM2 scatter epilogue reads its rows' ids / weights from LDS once into lanes and
+    # picks them with readlane, instead of an LDS round trip and readfirstlane per row (2: the peer bases too).
+    g2_epi_lean: int = 0
+    # Small-input GEMM1: K-steps its W1 / W1-scale loads are issued ahead of their MFMAs.
+    g1_lookahead: int = 1
+    # Small-input GEMM1: K-steps its A rows are loaded ahead of their MFMAs (2: through registers, see do_tile_la).
+    g1_a_ahead: int = 1
+    # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
+    # the source flag to every destination itself after its own drain, instead of the last of all producers storing
+    # it behind a rank-local done counter (0: off; at most _DIRECT_DONE_INC).
+    direct_done: int = 0
+    # Small-input fused kernel: each GEMM2 scatter wave drains its rows and adds one to their tokens' counters on
+    # the destination, whose combine reduces a token once its counter reaches valid routes x GEMM2 n-blocks instead
+    # of after every rank's grid ticket and flag (BF16 rows; the flags stay as the fallback).
+    tok_done: bool = False
+    # Small-input fused kernel: the combine polls its tokens' BF16 rows for the poison words every reducer leaves
+    # in the first _BF16_TOKENS tokens' rows, and sums them once none is left (no sender drain or counter; the
+    # flags stay as the fallback).
+    row_poll: bool = False
+    # Large-input GEMM1: m-tiles with at most this many real rows (an expert's padded tail) run a
+    # short_tail_rows-row tile (0: every m-tile runs sort_block_m rows).
+    short_tail_rows: int = 0
+    # With short_tail_rows: a tail tile with at most fold_tail real rows folds into its expert's preceding
+    # m-tile, which then runs sort_block_m + fold_tail rows and reads the W1 slab once for both (0: off).
+    fold_tail: int = 0
+    # With fold_tail: an expert's last m-tile with more than short_tail_rows real rows and at most mid_tail_rows
+    # runs a mid_tail_rows-row tile (0: off).
+    mid_tail_rows: int = 0
+    # Large-input plan: every wave of the plan CTA plans a slice of the local experts (False: one wave plans all).
+    parallel_plan: bool = False
+    # GEMM1 epilogue: output columns per lane in the quantize/store pass (2 or 8).
+    epi_evec: int = 2
+    # Large-input dispatch: a payload chunk issues one system release before its tile-ready and chunk_done RMWs
+    # (False: a second one before chunk_done).
+    merge_release: bool = False
+    # Large-input dispatch: an expert's last payload chunk does not publish payload_ready (no reader).
+    skip_payload_ready: bool = False
+    # Large-input GEMM1 with dedup_rows: one wave issues the acquire once the tile's row stamps landed, then
+    # a barrier (False: every wave acquires).
+    one_row_acquire: bool = False
+    # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
+    # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
+    no_chunk_release: bool = False
+    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
+    # the next step's A copy (False: the compiler makes it wait).
+    a_asm_reads: bool = False
+    # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
+    # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
+    batch_rows: bool = False
+    # Large-input parallel plan: the plan CTA's warp 1 sizes the payload geometry (read by the producers only, after
+    # pair_ready) next to the count exchange instead of before it, only warp 0 fences around the barriers every wave
+    # passes, and each wave loads its slice's counts and the peers' row-base pointers with the prefix counts.
+    lean_plan: bool = False
+    # Large-input lean parallel plan: a source writes each count word to its destination with this launch's tag in
+    # the high half, and every plan wave spins on the words it reads (False: count_done flags + a barrier).
+    tag_counts: bool = False
+    # Large-input dispatch with batch_rows: a route's histogram RMW result is its slot in a fixed-size per-expert
+    # bucket of the pair order, so the order is complete with the histogram (False: prefix + a cursor RMW pass).
+    bucket_pairs: bool = False
+    # Large-input dispatch with bucket_pairs: the payload producers count their routes before the launch gate, next to
+    # the owner's launch handshake (only the group_done RMW stays after it).
+    early_hist: bool = False
+    # Large-input dispatch: a payload producer reads the destination's rows per tile before the plan wait and its
+    # ready-order flag once after it (not in every chunk publish).
+    peer_hoist: bool = False
+    # Large-input launch: the owner clears its rank-local counters between sending and awaiting the launch handshake.
+    early_clear: bool = False
+    # Large-input dispatch with batch_rows: before the plan, the consumer CTAs send the token rows whose lowest expert
+    # at a destination is one of its first presend_experts local experts (the first payload round), so that round's
+    # tasks only send route headers (0: off).
+    presend_experts: int = 0
+    # With presend_experts: the presend covers presend_rows // tokens-on-this-rank experts instead (at least
+    # presend_experts, at most 64), so the first round's rows stay about constant as the rows per expert grow (0: off).
+    presend_rows: int = 0
+    # Large-input GEMM1 A scales staged to LDS in K-loop order: lane l's packed scale word of row group g at K-step s
+    # is one dword, so a K-step reads one ds_read_b32 per group (False: four ds_read_u8 per group, packed in VALU).
+    ascale_packed: bool = False
+    # GEMM1 epilogue (evec 8): the quantize/store pass without serial waits. Its lane offsets come from
+    # the tile, so they are not hoisted out of the persistent loop and reloaded from scratch between the output stores
+    # (each reload's vmcnt(0) waits for the stores before it); all rows' LDS reads go first; the 4-lane max uses DPP.
+    # Bit 1: SiLU as v_exp_f32 + v_rcp_f32 (no IEEE divide, no exp2 range fix).
+    epi_lean: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +201,47 @@ class Stage2Config:
     ascale_prefetch: bool = True
     spatial_partition: int = 402
     bf16_lds: bool = False
+    xcd_chunk: int = 0
+    row_align: int = 0
+    # Large-input fused kernel: stage the FP8 row scales rank-locally; the m-block's closing unit sends
+    # each row's scales as whole lines (needs row_align to leave the scale lines to the row).
+    scale_stage: bool = False
+    # Large-input fused kernel: every GEMM2 K-step issues its A copy, so its MFMAs no longer wait for it.
+    a_dma_uniform: bool = False
+    # Large-input fused kernel: drop a GEMM2 unit whose m-block is all padding at its claim (needs parallel_plan).
+    skip_pad: bool = False
+    # Large-input fused kernel: the GEMM2 epilogue's per-row chain skips most LDS round trips (readlane row ids and
+    # weights, DPP scale max, branch-free staged scale store).
+    epi_lean: bool = False
+    # Large-input fused kernel: each Combine wave starts its token once that token's rows arrived (per-token
+    # counts, cleared at launch) instead of after a generation barrier over every rank's GEMM2.
+    comb_tok_wait: bool = False
+    # Large-input fused kernel (with xcd_chunk): GEMM2 claims walk groups of this many m-blocks, all n-blocks of a
+    # group before the next, instead of one n-block over every m-block.
+    m_group: int = 0
+    # Large-input fused kernel (with m_group): one CTA in early_k leaves GEMM1 for GEMM2 once its claims pass
+    # early_p/16 of the GEMM1 work. Small-input kernel: the same, per XCD slice of the GEMM1 work.
+    early_k: int = 0
+    early_p: int = 8
+    # Large-input fused kernel (with early_k and a Stage1 mid_tail_rows): when the rank's tokens give its experts at
+    # most mid_tail_rows rows on average, the early CTAs leave after early_p_mid/16 instead (0: off).
+    early_p_mid: int = 0
+    # With early_k: pick the early CTAs (and every CTA's GEMM1 claim shard) by workgroup id, so each XCD has the same
+    # number of early CTAs and both sets cover every shard (False: by arrival ticket).
+    early_xcd: bool = False
+    # Large-input fused kernel (BM64 1-stage, with a_dma_uniform): a GEMM2 unit copies its m-block's A scales for
+    # every K-step into LDS once (LDS DMA past the A slots); the K-steps read them from LDS, not 2 loads per wave.
+    ascale_lds: bool = False
+    # Large-input fused kernel (BM64, with skip_pad, ascale_lds, scale_stage and an equal Stage1 fold_tail): a GEMM2
+    # unit whose next m-block is its expert's tail of at most fold_tail rows also runs those rows (80-row unit, one
+    # more MFMA row group and a 16-row epilogue pass); the tail's own units are dropped at their claim (0: off).
+    fold_tail: int = 0
+    # Large-input fused kernel (with fold_tail, cached W2): a GEMM2 unit whose m-block (with its folded tail) is its
+    # expert's only one streams its W2 slab (nt), as no other m-block rereads it from L2.
+    nt_single: bool = False
+    # Large-input fused kernel (with epi_lean): the P2P rows carry offset int8 (u8 = q + 128) with the same E8M0
+    # scale per 32 values instead of E4M3: same bytes, about half the transport rounding error.
+    route_i8: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,15 +360,143 @@ def _large_config(
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32")
 
 
+def _tune_v41_flash_ep4(config: MegaMoEConfig, bucket: int, mtpr: int) -> MegaMoEConfig:
+    """EP4 DeepSeek-V4.1-Flash (96 experts per rank), measured on gfx950."""
+    if mtpr == LARGE_M_MTPR:
+        # One payload producer per destination leaves its ~16 MB a ~750 us copy at 2048 tokens a rank;
+        # 12 split the destination's experts (-24%). XCD-affine GEMM2 claims share each W2 slab in one
+        # XCD's L2 across the expert's m-blocks (-5%). 128-byte P2P rows keep each GEMM2 scatter store
+        # off the cache lines its neighbouring rows' stores touch (-1%). An expert just past 128 rows pads a
+        # second m-tile that is mostly padding; it runs 32 rows instead of 128 (-6%). Row scales leave once per
+        # row as whole lines from the m-block's last n-block, not as ten 16-byte partial-line writes (-2.5%).
+        # A tail of at most 16 rows rides on its expert's previous m-tile, sharing its W1 reads (-1.2%; 32
+        # rows spill the K-loop). All waves of the plan CTA plan the 96 experts, not one (-1.4%), and write
+        # each expert's padding rows together (-1%). The GEMM1 epilogue quantizes 8 columns a lane and stores
+        # them as one 8-byte write (-1.4%). A token row goes to each destination once, from the route to its
+        # lowest expert there (sent first), and GEMM1 waits for the row's arrival stamp (-2.8%). A payload
+        # chunk's chunk_done RMW reuses its tile-ready release (-1.8%), and an expert's last chunk skips the
+        # unread payload_ready release and RMW (-1.9%). One wave, not every wave, invalidates the caches once a
+        # GEMM1 tile's rows landed (-1.1%). A chunk's drained peer stores (uncached heap) need no release before its
+        # tile-ready RMW (-1.7%). GEMM1 reads its A operands in inline asm, so a K-step's first read does not wait for
+        # the next step's A copy, which the compiler cannot tell from this step's buffer (-1.5%). GEMM2 drops an
+        # all-padding m-block at its claim instead of after its GEMM1 tile, and issues its A copy on every K-step so
+        # the MFMAs do not wait for the copy two steps ahead (-1.4% together). A payload chunk resolves its routes one
+        # per thread and copies the sent rows with their loads ahead of the stores, so 8 producers a destination
+        # keep up and the other 16 CTAs run GEMM1 from the start (-1.3%; 8 with the row-at-a-time copy: +1.1%).
+        # The plan sizes the payload geometry off its serial path, fences once instead of in every wave, and loads
+        # its inputs in one round (-1%). The token rows of the first payload round (each destination's first 8
+        # experts) cross XGMI while the plan runs, so GEMM1 starts sooner (-2.2%; 32 experts crowd the plan: +5%).
+        # Each Combine wave starts once its own token's rows arrived, not after every rank's GEMM2 (-1.8%): the ranks
+        # that finish GEMM2 before the most loaded one reduce most of their tokens while it still runs.
+        # GEMM2 is XGMI-bound and the links idle once the dispatch is done, while GEMM1 still runs: half the CTAs
+        # leave GEMM1 for GEMM2 after a claim past a quarter of the GEMM1 work, with GEMM2 claiming 8 m-blocks
+        # at a time in all n-blocks, so the early units find their GEMM1 m-tiles done (-7.5%).
+        # Count words carry the launch tag, so the plan spins on them instead of a count_done round, and each route's
+        # histogram RMW is its slot in a per-expert pair-order bucket, so the producers start without the prefix /
+        # cursor pass; warp 1 sizes the geometry while the other waves plan (-1.2%). GEMM1 stages its A scales in K-loop
+        # order, so a K-step reads each row group's scale word with one ds_read_b32 instead of four serial ds_read_u8
+        # and a VALU pack (-1.8%). Early GEMM2 CTAs are picked per XCD, and the GEMM2 epilogue's per-row chain skips
+        # most LDS round trips (readlane row ids, DPP scale max) (-1.2% together). The GEMM1 epilogue quantizes and
+        # stores without scratch-reload store drains and with a v_rcp SiLU, and a GEMM2 unit copies its m-block's
+        # A scales to LDS once instead of two scale loads per K-step (-1.6% together, each alone below 1%).
+        # An expert's GEMM2 tail of at most 16 rows (~40% of the experts have 129-144 rows) rides on its previous
+        # m-block as an 80-row unit instead of running ten 64-row units of its own (-1.4%).
+        # An expert's last GEMM1 m-tile with 33-64 real rows runs 64 rows, not 128 (-4% at 512 tokens a rank,
+        # where most experts have one ~32-row tile; -1.9% at 1024, neutral at 256-384 and 2048).
+        # GEMM1 streams its W1 loads (nt), as the small buckets: -2% at 512 and 1024, where the short and mid
+        # tiles wait on W1, -0.7% at 2048.
+        # A GEMM2 unit whose m-block is its expert's only one streams W2 (nt) as well: no other m-block rereads the
+        # slab from L2 (-5% at 512, -4% at 1024, -0.7% at 2048, where most experts keep cached loads).
+        # With W2 streamed, up to 64 rows an expert (1024 tokens a rank) the early CTAs leave GEMM1 after 6/16 of its
+        # work instead of 4/16 (-2% at 512, -1.4% at 1024; the later start loses 1.2% at 1280-2048, so it stays 4/16 there).
+        # The P2P rows carry offset int8 instead of E4M3 under the same E8M0 scales: relL2 vs the fp32 reference
+        # 0.0583 -> 0.0525 at 512-2048 tokens, at no measurable cost (same bytes; the extra cvt sits off the XGMI bound).
+        # The presend covers 16384 // tokens experts (8..64): about the same rows at every token count, where 8
+        # experts fit 2048 tokens only (-1% at 512, -1.4% at 1024, -0.7% at 256, unchanged at 2048).
+        # Up to 640 tokens a rank each destination gets 12 payload producers, not 8: the GEMM1 tiles that wait on
+        # the dispatch are most of the first round there (-1.2% at 512, -0.8% at 256; neutral at 768-2048).
+        # The launch head is serial up to the first GEMM1 tile: the producers count their routes before the gate
+        # (written through, so group_done needs no L2 writeback), the owner clears its counters while the handshake
+        # travels, and producers read the destination's rows per tile / ready order once (-1% at 256 and 512).
+        return replace(
+            config,
+            stage1=replace(
+                config.stage1, payload_min_blocks=8, b_nt=3, batch_rows=True, short_tail_rows=32, fold_tail=16,
+                mid_tail_rows=64,
+                parallel_plan=True, epi_evec=8, dedup_rows=True, merge_release=True,
+                skip_payload_ready=True, one_row_acquire=True, no_chunk_release=True, a_asm_reads=True,
+                payload_small_blocks=12, payload_small_tokens=640,
+                lean_plan=True, presend_experts=8, presend_rows=16384, tag_counts=True, bucket_pairs=True,
+                ascale_packed=True, epi_lean=3, early_hist=True, early_clear=True, peer_hoist=True,
+            ),
+            stage2=replace(config.stage2, xcd_chunk=32, row_align=128, scale_stage=True, a_dma_uniform=True,
+                skip_pad=True, comb_tok_wait=True, m_group=8, early_k=2, early_p=4, early_p_mid=6, early_xcd=True,
+                epi_lean=True, ascale_lds=True, fold_tail=16, nt_single=True, route_i8=True),
+        )
+    # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
+    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). On for every bucket, as the ranks of a launch may
+    # pick different ones.
+    config = replace(config, stage1=replace(config.stage1, dedup_rows=True))
+    # The plan reaches every CTA in one hop: the plan CTA writes it through to memory and publishes the flag without
+    # an L2 writeback, and each CTA waits on the flag itself instead of behind its XCD's acquire and republish
+    # (-1.8% at 1 token, neutral at 8-512).
+    config = replace(config, stage1=replace(config.stage1, plan_direct=True, plan_wt=True))
+    # Every CTA builds the plan from the expert counts itself once the sources are done, so GEMM1 starts without
+    # the plan CTA's metadata stores and flag hop, and takes its tile metadata from LDS (-3% at 1 token, -2% at 8,
+    # -1.2% at 32, -0.3..-0.6% at 128-512). On for every bucket: the counters' reset point moves to the combine.
+    config = replace(config, stage1=replace(config.stage1, plan_local=True))
+    # With at most 8 route-carrying producers (1-2 tokens), each one adds its share of the source flag to every
+    # destination after its own drain, skipping the last-producer counter hop (-1.5% at 1 token, -1% at 2,
+    # neutral at 16; 24 producers at 16 tokens: +1.3%).
+    config = replace(config, stage1=replace(config.stage1, direct_done=8))
+    # GEMM2 keeps the pointers it reads from the dispatch table in SGPRs: every load of its K-loop sat in a
+    # waterfall loop (-1.6..-2.4% at 1-32 tokens, where the GEMM2 K-loop is latency-bound; -0.7..-0.1% at 64-128).
+    # The 64-row tiles of 256-512 tokens spill with it (+5..+7%).
+    config = replace(config, stage1=replace(config.stage1, g2_uniform=bucket <= 128))
+    if bucket <= 4:
+        # GEMM1 runs one round of tiles, so its epilogue is on the critical path: the large-input lean epilogue
+        # (8 columns a lane, no serial store waits, fast SiLU) cuts 3% at 1 and 4 tokens (neutral at 8-16).
+        config = replace(config, stage1=replace(config.stage1, epi_evec=8, epi_lean=3))
+        # The combine takes a token once its routes' GEMM2 rows are counted on it, not after every rank's last CTA
+        # publishes its flag: the ticket -> flag -> reduce hops leave the tail (-3% at 1 token, -2.2% at 2 and 4
+        # with the lane-fed scatter it needs; +0.8% at 8, +1.6% at 16, +2.9% at 128 from the per-unit drains).
+        config = replace(config, stage1=replace(config.stage1, g2_epi_lean=2, tok_done=True))
+    if bucket == 1:
+        # Streaming GEMM1 weight loads, as the larger buckets (-8%). Head pointers in SGPRs: 160 -> 17 waterfall
+        # loops, 244 -> 217 VGPR (-2%; neutral at 4-128 tokens, +4% at 256-512). GEMM2 scatter rows take their ids,
+        # weights and peer bases from lanes (-1.1%; -0.7% at 4 tokens, neutral at 16-128). GEMM1 loads a K-step's A
+        # rows two steps ahead into registers and W1 two steps ahead in a fully unrolled K-loop, one wave a SIMD
+        # (-2.4%; either alone, or W1 ahead in the rolled loop, is slower).
+        return replace(config, stage1=replace(config.stage1, b_nt=3, head_uniform=True, g2_epi_lean=2,
+            g1_a_ahead=2, g1_lookahead=2, waves_per_eu_hint=1))
+    if bucket == 16:
+        # Half the GEMM1 n-tiles (tile_n 256, -3.5%) and GEMM2 block_n 256 (-3%): longer weight slabs per tile.
+        return replace(
+            config, stage1=replace(config.stage1, tile_n=256), stage2=replace(config.stage2, block_n=256)
+        )
+    if bucket == 128:
+        # Half the GEMM1 n-tiles of tile_n 128: each streams a longer W1 slab (-4%).
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    if bucket == 512:
+        # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound
+        # GEMM2 scatter starts while GEMM1 still runs (-2.7%; a quarter: +1.1%, neutral to +1.2% at 128 tokens).
+        return replace(config, stage2=replace(config.stage2, early_k=2, early_p=8))
+    return config
+
+
 @cache
 def _select_config(
     bucket: int, mtpr: int, experts_per_rank: int, model_dim: int, inter_dim: int
 ) -> MegaMoEConfig:
     if mtpr == LARGE_M_MTPR:
-        return _large_config(experts_per_rank, model_dim, inter_dim)
-    stage1 = _select_fixed_stage1(bucket, experts_per_rank)
-    stage2 = _select_fixed_stage2(bucket, model_dim)
-    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+        config = _large_config(experts_per_rank, model_dim, inter_dim)
+    else:
+        stage1 = _select_fixed_stage1(bucket, experts_per_rank)
+        stage2 = _select_fixed_stage2(bucket, model_dim)
+        config = MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+    if (experts_per_rank, model_dim, inter_dim) == (128, 5120, 2304):
+        config = _tune_v41_flash_ep4(config, bucket, mtpr)
+    return config
 
 
 def select_mega_moe_config(
@@ -235,8 +514,8 @@ def select_mega_moe_config(
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if tokens > mtpr:
         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
-    if experts_per_rank <= 0 or experts_per_rank > 64:
-        raise ValueError(f"experts_per_rank must be in [1, 64], got {experts_per_rank}")
+    if experts_per_rank <= 0 or experts_per_rank > 128:
+        raise ValueError(f"experts_per_rank must be in [1, 128], got {experts_per_rank}")
     if model_dim <= 0 or inter_dim <= 0:
         raise ValueError(f"invalid model shape {model_dim}x{inter_dim}")
     return _select_config(
@@ -389,24 +668,33 @@ class ATileLoader:
                 128,
             )
 
-    def for_tile(self, tile_row_base_i32, valid_rows_i32=None):
+    def for_tile(self, tile_row_base_i32, valid_rows_i32=None, row_map=None, srcs=None):
         """Precompute LDS and tile-local global offsets for one M tile.
 
         valid_rows_i32 clamps the buffer's num_records: padding rows read back as 0 without touching memory.
+        row_map (dedup_rows dispatch) with srcs = load_row_map(): tile row r reads token row
+        srcmap[tile_row_base + r] & 0xFFFFFF of the region at byte row_map["x_token"] of x; offsets from
+        row_map["x_bytes"] on are out of bounds. Without valid_rows_i32, rows whose source slot is not below
+        row_map["rows"] are the padding.
         """
-        tile_iter = fx.add_offset(
-            fx.get_iter(self._x_tensor),
-            fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
-        )
+        if const_expr(row_map is not None):
+            tile_iter = fx.get_iter(self._x_tensor)
+            nrec = row_map["x_bytes"]
+        else:
+            tile_iter = fx.add_offset(
+                fx.get_iter(self._x_tensor),
+                fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
+            )
         tile_view = fx.Tensor(
             fx.make_view(
                 tile_iter, fx.make_layout(self._sort_block_m * self._row_bytes, 1)
             )
         )
-        if valid_rows_i32 is None:
-            nrec = fx.Int32(self._sort_block_m * self._row_bytes)
-        else:
-            nrec = fx.Int32(valid_rows_i32) * fx.Int32(self._row_bytes)
+        if const_expr(row_map is None):
+            if valid_rows_i32 is None:
+                nrec = fx.Int32(self._sort_block_m * self._row_bytes)
+            else:
+                nrec = fx.Int32(valid_rows_i32) * fx.Int32(self._row_bytes)
         self._tile_rsrc = _make_buffer(
             tile_view,
             fx.Int32,
@@ -428,11 +716,23 @@ class ATileLoader:
         row_stride_i32 = self._k_step_bytes // 4
         total_chunks = self._sort_block_m * chunks_per_row
         self._chunks = []
+        self._dma_rows = []
         for c in range_constexpr(0, total_chunks, self._total_threads):
             lin = fx.Int32(c) + fx.Int32(self._tx)
             row = lin // fx.Int32(chunks_per_row)
             chunk = lin % fx.Int32(chunks_per_row)
-            row_byte = row * fx.Int32(self._row_bytes)
+            if const_expr(row_map is not None):
+                # Padding rows point past the buffer and read back as 0.
+                src = srcs[len(self._chunks)]
+                row_byte = _token_offset(src, self._row_bytes, row_map["x_token"])
+                if const_expr(valid_rows_i32 is None):
+                    real = (src & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
+                else:
+                    real = row < valid_rows_i32
+                row_byte = real.select(row_byte, nrec)
+                self._dma_rows.append(row_byte)
+            else:
+                row_byte = row * fx.Int32(self._row_bytes)
             if const_expr(self._swizzle):
                 col_i32 = chunk * fx.Int32(4)
                 swz = row * fx.Int32(row_stride_i32) + (
@@ -441,14 +741,32 @@ class ATileLoader:
                 lds_byte = swz * fx.Int32(4)
             else:
                 lds_byte = lin * fx.Int32(16)
-            self._chunks.append((lds_byte, row_byte + chunk * fx.Int32(16)))
+            if const_expr(row_map is not None):
+                # 16-byte group index: a mapped row offset is not known non-negative, so dividing in the K-loop
+                # would cost a signed division per chunk and K-step.
+                self._chunks.append((lds_byte, row_byte.shrui(fx.Int32(4)) + chunk))
+            else:
+                self._chunks.append((lds_byte, row_byte + chunk * fx.Int32(16)))
+        self._group_chunks = row_map is not None
+
+    def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
+        """The srcmap words of this thread's chunk rows (for_tile row_map)."""
+        chunks_per_row = self._k_step_bytes // 16
+        return [
+            _buffer_load(srcmap_rsrc, tile_row_base_i32 + (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(chunks_per_row),
+                fx.Int32)
+            for c in range_constexpr(0, self._sort_block_m * chunks_per_row, self._total_threads)
+        ]
 
     def load_regs(self, k_step_byte_off):
         """Read this K-step's 16-B chunks gmem->reg (VMEM); only the K-step offset varies. Returns (lds_off, vec4)."""
         koff = fx.Int32(k_step_byte_off)
         regs = []
         for lds_byte, chunk_base in self._chunks:
-            group = (chunk_base + koff) // fx.Int32(16)
+            if const_expr(self._group_chunks):
+                group = chunk_base + koff // fx.Int32(16)
+            else:
+                group = (chunk_base + koff) // fx.Int32(16)
             regs.append((lds_byte, _buffer_load(self._tile_rsrc, group, fx.Int32, 4)))
         return regs
 
@@ -476,11 +794,11 @@ class ATileLoader:
             lds_dst.ptr,
         )
         total_chunks = self._sort_block_m * 16
-        for round_base in range_constexpr(
+        for i, round_base in enumerate(range_constexpr(
             0,
             total_chunks,
             self._total_threads,
-        ):
+        )):
             physical = fx.Int32(round_base) + fx.Int32(self._tx)
             row = physical // fx.Int32(16)
             physical_chunk = physical % fx.Int32(16)
@@ -488,9 +806,11 @@ class ATileLoader:
                 logical_chunk = physical_chunk ^ (row & fx.Int32(15))
             else:
                 logical_chunk = physical_chunk
-            src_byte = (
-                row * fx.Int32(self._row_bytes) + koff + logical_chunk * fx.Int32(16)
-            )
+            if const_expr(self._group_chunks):
+                row_byte = self._dma_rows[i]
+            else:
+                row_byte = row * fx.Int32(self._row_bytes)
+            src_byte = row_byte + koff + logical_chunk * fx.Int32(16)
             src = fx.slice(
                 self._tile_dma,
                 (None, src_byte),
@@ -506,10 +826,12 @@ class ATileLoader:
 class AS2RLoader:
     """Load one FP8 MFMA A operand from row-major LDS."""
 
-    def __init__(self, *, k_step_bytes, swizzle=False):
+    def __init__(self, *, k_step_bytes, swizzle=False, asm_reads=False):
         self._k_step_bytes = k_step_bytes
         self._swizzle = swizzle
         self._lane = fx.thread_idx.x % 64
+        # asm_reads: load_operand_in_flight reads through inline asm (see there).
+        self.asm_reads = asm_reads
 
     def _load_16b(self, lds_src, i32_off):
         # add_offset+recast preserves the LDS address space.
@@ -538,6 +860,42 @@ class AS2RLoader:
         return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
             fx.Int32
         )
+
+    def load_operand_in_flight(self, lds_src, mi, ksub, base_i32=0):
+        """load_operand while this K-step's A copy into the other LDS buffer is in flight.
+
+        With asm_reads the two ds_read_b128 (and their lgkmcnt wait) are inline asm: the compiler sees no LDS read,
+        so it does not make the first read of the K-step wait (vmcnt) for the next step's LDS DMA, which it
+        cannot tell apart from this step's buffer. The K-step's closing vmcnt wait + barrier orders the DMA.
+        """
+        if const_expr(not self.asm_reads):
+            return self.load_operand(lds_src, mi, ksub, base_i32)
+        row = fx.Int32(self._lane % 16)
+        row_i32 = row * fx.Int32(self._k_step_bytes // 4) + fx.Int32(base_i32)
+        klane4 = fx.Int32(self._lane // 16) * fx.Int32(4)
+
+        def _c(col):
+            if const_expr(self._swizzle):
+                return col ^ (row << fx.Int32(2))
+            return col
+
+        col_lo = klane4 + fx.Int32(ksub * 32)
+        lds_base = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        addr_lo = lds_base + (row_i32 + _c(col_lo)) * fx.Int32(4)
+        addr_hi = lds_base + (row_i32 + _c(col_lo + fx.Int32(16))) * fx.Int32(4)
+        # Row mi * 16 + lane % 16: the swizzle only sees lane % 16, so mi is an immediate offset.
+        imm = mi * 16 * self._k_step_bytes
+        v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+        pair = llvm.inline_asm(
+            ir.Type.parse("!llvm.struct<(vector<4xi32>, vector<4xi32>)>"),
+            [_raw(addr_lo), _raw(addr_hi)],
+            f"ds_read_b128 $0, $2 offset:{imm}\nds_read_b128 $1, $3 offset:{imm}\ns_waitcnt lgkmcnt(0)",
+            "=&v,=&v,v,v",
+            has_side_effects=True,
+        )
+        lo = Vec(llvm.extractvalue(v4, pair, [0])).bitcast(fx.Int64)
+        hi = Vec(llvm.extractvalue(v4, pair, [1])).bitcast(fx.Int64)
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(fx.Int32)
 
 
 class BWeightLoader:
@@ -611,10 +969,17 @@ class BScaleLoader:
         return out
 
 
+def _token_offset(srcmap_word, row_units, token_base):
+    """Offset (row_units per row) of a tile row's token row (srcmap source token slot) in the region at token_base."""
+    return token_base + (srcmap_word & fx.Int32(0xFFFFFF)) * fx.Int32(row_units)
+
+
 class AScaleLoader:
     """Per-1x32 E8M0 A scales STAGED to LDS once per tile (stage), read via ds_read in K-loop (kills VMEM flood)."""
 
-    def __init__(self, *, scale_rsrc, m_repeat, model_dim, sort_block_m, total_threads):
+    def __init__(self, *, scale_rsrc, m_repeat, model_dim, sort_block_m, total_threads, packed=False):
+        # packed: LDS dword (s * n_groups + g) * 64 + lane is that lane's load_step word of group g at K-step s.
+        self._packed = packed
         self._rsrc = scale_rsrc
         self._n_scale = model_dim // 32
         self._lane = fx.thread_idx.x % 64
@@ -623,19 +988,24 @@ class AScaleLoader:
         self._total_threads = total_threads
         self._tx = fx.thread_idx.x
 
-    def stage(self, lds_ascale, tile_row_base_i32):
-        """Coalesced gmem->LDS copy of this tile's e8m0 A-scale block [sort_block_m, n_scale]. Call before K-loop."""
+    def stage(self, lds_ascale, tile_row_base_i32, row_map=None, valid_rows_i32=None, srcs=None):
+        """Coalesced gmem->LDS copy of this tile's e8m0 A-scale block [sort_block_m, n_scale]. Call before K-loop.
+
+        row_map / srcs as ATileLoader.for_tile (row_map["scale_token"]: the token region in 16-byte groups), srcs
+        from this loader's load_row_map; padding rows take the first scale row.
+        """
         total = self._sort_block_m * self._n_scale
         assert total % 16 == 0, "A-scale tile must contain whole 16-byte copy chunks"
         base = tile_row_base_i32 * fx.Int32(self._n_scale)
         n16 = total // 16
+        row_chunks = self._n_scale // 16
 
         @flyc.jit
-        def copy_chunk(lin: fx.Int32):
+        def copy_chunk(lin: fx.Int32, group: fx.Int32):
             if lin < fx.Int32(n16):
                 v = _buffer_load(
                     self._rsrc,
-                    (base + lin * fx.Int32(16)) // fx.Int32(16),
+                    group,
                     fx.Int32,
                     4,
                 )
@@ -645,16 +1015,51 @@ class AScaleLoader:
                     ),
                     fx.make_layout(4, 1),
                 )
-                fragment = fx.make_rmem_tensor(4, fx.Int32)
-                fragment.store(v)
-                fx.copy(
-                    fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst
-                )
+                if const_expr(self._packed):
+                    # Chunk c of row r holds the scales of K-steps 2c and 2c+1; byte j goes to K-step 2c + j // 8,
+                    # lane (j % 4) * 16 + r % 16, byte (r // 16) % 2 + 2 * ((j // 4) % 2) of group r // 32's word.
+                    row = lin // fx.Int32(row_chunks)
+                    c = lin - row * fx.Int32(row_chunks)
+                    base = ((c * fx.Int32(2 * self._n_groups) + (row >> fx.Int32(5))) * fx.Int32(256)
+                        + (row & fx.Int32(15)) * fx.Int32(4) + ((row >> fx.Int32(4)) & fx.Int32(1)))
+                    i8_ptr = fx.recast_iter(fx.Int8, lds_ascale.ptr)
+                    vb = Vec(v).bitcast(fx.Int8)
+                    for j in range_constexpr(16):
+                        imm = (j // 8) * self._n_groups * 256 + (j % 4) * 64 + ((j // 4) % 2) * 2
+                        fx.make_view(fx.add_offset(i8_ptr, base + fx.Int32(imm)), fx.make_layout(1, 1)).store(
+                            Vec.from_elements([vb[j]], fx.Int8))
+                else:
+                    fragment = fx.make_rmem_tensor(4, fx.Int32)
+                    fragment.store(v)
+                    fx.copy(
+                        fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst
+                    )
 
-        for c in range_constexpr(0, n16, self._total_threads):
+        for i, c in enumerate(range_constexpr(0, n16, self._total_threads)):
             lin = fx.Int32(c) + fx.Int32(self._tx)
+            if const_expr(row_map is not None):
+                row = lin // fx.Int32(row_chunks)
+                row_group = _token_offset(srcs[i], row_chunks, row_map["scale_token"])
+                if const_expr(valid_rows_i32 is None):
+                    real = (srcs[i] & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
+                else:
+                    real = row < valid_rows_i32
+                group = real.select(row_group, fx.Int32(0)) + lin - row * fx.Int32(row_chunks)
+            else:
+                group = (base + lin * fx.Int32(16)) // fx.Int32(16)
             # M32 has 448 chunks, which is not divisible by a 256/512-thread CTA.
-            copy_chunk(lin)
+            copy_chunk(lin, group)
+
+    def load_row_map(self, tile_row_base_i32, srcmap_rsrc):
+        """The srcmap words of this thread's chunk rows (stage row_map); rows past the tile read its last row."""
+        row_chunks = self._n_scale // 16
+        assert self._n_scale % 16 == 0
+        out = []
+        for c in range_constexpr(0, self._sort_block_m * row_chunks, self._total_threads):
+            row = (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(row_chunks)
+            row = (row < fx.Int32(self._sort_block_m)).select(row, fx.Int32(self._sort_block_m - 1))
+            out.append(_buffer_load(srcmap_rsrc, tile_row_base_i32 + row, fx.Int32))
+        return out
 
     def load_step(self, lds_ascale, kstep_i32):
         """One packed i32 per pack-group, read from the LDS-staged A-scale (ds_read)."""
@@ -663,6 +1068,13 @@ class AScaleLoader:
             self._lane // 16
         )  # e8m0 col = kstep*8 + ksub*4 + KLane
         out = []
+        if const_expr(self._packed):
+            i32_ptr = fx.recast_iter(fx.Int32, lds_ascale.ptr)
+            base = kstep_i32 * fx.Int32(self._n_groups * 64) + fx.Int32(self._lane)
+            for g in range_constexpr(self._n_groups):
+                v = fx.make_view(fx.add_offset(i32_ptr, base + fx.Int32(g * 64)), fx.make_layout(1, 1)).load()
+                out.append(Vec(v, dtype=fx.Int32)[0])
+            return out
         for g in range_constexpr(self._n_groups):
             r0 = fx.Int32(g * 32) + lane_row
             r1 = r0 + fx.Int32(16)
@@ -844,9 +1256,16 @@ class SiluQuantEpilogue:
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
         sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None,
-        out_cache_modifier=0):
+        out_cache_modifier=0, tile_rows=None, evec=2, lean=0):
     # fmt: on
         self._out_rsrc = out_rsrc
+        # evec: output columns per lane in the quantize/store pass (8: a quarter of a 32-column scale group, stored as
+        # one 8-byte write; needs out_tensor).
+        assert evec in (2, 8) and (evec == 2 or out_tensor is not None)
+        self._evec = evec
+        # lean: bit 0 = _quant_store_v8 without serial waits, bit 1 = fast SiLU (see Stage1Config.epi_lean).
+        self._lean = bool(lean & 1)
+        self._fast_silu = bool(lean & 2)
         self._out_scale_rsrc = out_scale_rsrc
         self._sorted_rsrc = sorted_rsrc
         self._tokens = tokens
@@ -854,6 +1273,8 @@ class SiluQuantEpilogue:
         self._m_repeat = m_repeat
         self._num_acc_n = num_acc_n
         self._sort_block_m = sort_block_m
+        # Rows actually computed (leading rows of the sort_block_m tile); the rest are left unwritten.
+        self._tile_rows = sort_block_m if tile_rows is None else tile_rows
         self._tile_n = tile_n
         self._num_waves = num_waves
         self._lds_out = lds_out
@@ -866,6 +1287,9 @@ class SiluQuantEpilogue:
         self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
 
     def _silu(self, g):
+        if const_expr(self._fast_silu):
+            emu = (g * fx.Float32(-1.4426950408889634)).exp2(fastmath="afn")
+            return g * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + emu)))
         emu = (g * fx.Float32(-1.4426950408889634)).exp2()
         return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
 
@@ -936,12 +1360,16 @@ class SiluQuantEpilogue:
 
         c64 = fx.Int32(64)
         n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
+        if const_expr(self._evec == 8):
+            self._quant_store_v8(cptr, out_rsrc, tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, valid_rows_i32,
+                store_cm)
+            return
         NLANE = 32
         EVEC = 2
         rows_per_iter = self._num_waves * 64 // NLANE
         mlane = tx // fx.Int32(NLANE)
         nlane = tx % fx.Int32(NLANE)
-        m_reps = self._sort_block_m // rows_per_iter
+        m_reps = self._tile_rows // rows_per_iter
         n_reps = cs_tile_n // (NLANE * EVEC)
         out_tile_base = n_tile_base_i32 // fx.Int32(2) - cbase
 
@@ -1005,6 +1433,82 @@ class SiluQuantEpilogue:
         wait_lds_barrier()
 
 
+    def _quant_store_v8(self, cptr, out_rsrc, tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, valid_rows_i32,
+        store_cm):
+        """store()'s quantize pass with 8 columns per lane: 4 lanes share a 32-column scale group."""
+        tx = fx.thread_idx.x
+        if const_expr(self._lean):
+            # tile_i32 >= 0, so tx is unchanged, but its offsets are no longer loop-invariant.
+            tile_zero = (tile_i32 < fx.Int32(0)).select(tile_i32, fx.Int32(0))
+            tx = (tx + tile_zero) & fx.Int32(self._num_waves * 64 - 1)
+        c64 = fx.Int32(64)
+        n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
+        cs_tile_n = self._tile_n // 2
+        NLANE = cs_tile_n // 8
+        rows_per_iter = self._num_waves * 64 // NLANE
+        assert self._tile_rows % rows_per_iter == 0
+        mlane = tx // fx.Int32(NLANE)
+        nlane = tx % fx.Int32(NLANE)
+        # 8-byte groups of the tile's output rows.
+        out_rsrc = _make_buffer(
+            fx.Tensor(fx.make_view(fx.add_offset(fx.get_iter(self._out_tensor),
+                fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim)), fx.make_layout(1, 1))),
+            fx.Int32, 2, max_size=False,
+            num_records_bytes=(fx.Int32(self._sort_block_m * self._inter_dim) if valid_rows_i32 is None
+                               else valid_rows_i32 * fx.Int32(self._inter_dim)),
+        )
+        col0 = nlane * fx.Int32(8)
+        gcol = n_tile_base_i32 // fx.Int32(2) - cbase + col0
+        col_s = gcol >> fx.Int32(5)
+        is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
+        n_iter = self._tile_rows // rows_per_iter
+
+        def load_row(mr):
+            idx = (fx.Int32(mr * rows_per_iter) + mlane) * fx.Int32(cs_tile_n) + col0
+            f32_iter = fx.recast_iter(fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx)))
+            return fx.make_view(f32_iter, fx.make_layout(8, 1)).load()
+
+        frags = [load_row(mr) for mr in range_constexpr(n_iter)] if const_expr(self._lean) else None
+        for mr in range_constexpr(n_iter):
+            row = fx.Int32(mr * rows_per_iter) + mlane
+            row_g = tile_i32 * fx.Int32(self._sort_block_m) + row
+            frag = frags[mr] if const_expr(self._lean) else load_row(mr)
+            v = [frag[i] for i in range_constexpr(8)]
+            a = [x.maximumf(fx.Float32(0.0) - x) for x in v]
+            m = a[0]
+            for i in range_constexpr(1, 8):
+                m = m.maximumf(a[i])
+            for off in (1, 2):
+                if const_expr(self._lean):
+                    m = m.maximumf(fx.Float32(dpp_xor_f32(m, off)))
+                else:
+                    m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
+            max_rounded = (m.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
+            _e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
+            e8m0_v = (_e > fx.Int32(0)).select(_e, fx.Int32(0))
+            quant_scale = ((fx.Int32(254) - e8m0_v) << fx.Int32(23)).bitcast(fx.Float32)
+            words = []
+            for w in range_constexpr(2):
+                lo = rocdl.cvt_pk_fp8_f32(T.i32, v[4 * w] * quant_scale, v[4 * w + 1] * quant_scale, fx.Int32(0), False)
+                words.append(fx.Int32(rocdl.cvt_pk_fp8_f32(
+                    T.i32, v[4 * w + 2] * quant_scale, v[4 * w + 3] * quant_scale, lo, True)))
+            valid = fx.Boolean(True) if valid_rows_i32 is None else row < valid_rows_i32
+            out_byte = valid.select(row * fx.Int32(self._inter_dim) + gcol, fx.Int32(0x40000000))
+            _buffer_store(out_rsrc, out_byte // fx.Int32(8), Vec.from_elements(words, fx.Int32), fx.Int32, 2,
+                cache_modifier=store_cm)
+            writer = is_writer if valid_rows_i32 is None else is_writer & (row < valid_rows_i32)
+            d0 = row_g >> fx.Int32(5)
+            d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
+            d2 = row_g & fx.Int32(15)
+            d3 = col_s >> fx.Int32(3)
+            d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
+            d5 = col_s & fx.Int32(3)
+            byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
+            byte_off = writer.select(byte_off, fx.Int32(0x40000000))
+            _buffer_store(self._out_scale_rsrc, byte_off, e8m0_v.to(fx.Int8), fx.Int8, cache_modifier=store_cm)
+        wait_lds_barrier()
+
+
 class _LdsF32View:
     def __init__(self, ptr):
         self.ptr = ptr
@@ -1014,11 +1518,11 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, rows_rsrc=None):
+    mfma_amajor, async_a_copy, trb_rsrc, rows_rsrc=None, row_map=None):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
-    NUM_A_SCALE = M_REPEAT // _PACK
+    NUM_A_SCALE = (M_REPEAT + 1) // _PACK
     B_STATE_END = (
         N_ACC + NUM_ACC_N * _PACK
     )
@@ -1026,7 +1530,15 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     last = fx.Int32(K_ITERS - 1)
     tile_row_base = _buffer_load(trb_rsrc, m_tile, fx.Int32)
     b_row = sched.gate_base_row(expert) + n_tile_base
-    a_gather.for_tile(tile_row_base, None if rows_rsrc is None else _buffer_load(rows_rsrc, m_tile, fx.Int32))
+    if const_expr(row_map is not None):
+        # The rows sit in the token-row region; row_map["wait"] returns once every row of the tile landed.
+        assert rows_rsrc is None
+        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"])
+        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"])
+        row_map["wait"](a_srcs)
+        a_gather.for_tile(tile_row_base, None, row_map, a_srcs)
+    else:
+        a_gather.for_tile(tile_row_base, None if rows_rsrc is None else _buffer_load(rows_rsrc, m_tile, fx.Int32))
     if const_expr(pipe_weights):
         if const_expr(async_a_copy):
             a_gather.prefetch_to_lds(
@@ -1040,7 +1552,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_row_base)
+        if const_expr(row_map is not None):
+            a_scale.stage(a_scale_lds, tile_row_base, row_map, None, s_srcs)
+        else:
+            a_scale.stage(a_scale_lds, tile_row_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         b0 = b_loader.load_step(b_row, fx.Int32(0))
         init = [mfma.zero_value for _ in range(N_ACC)]
@@ -1088,7 +1603,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 )
 
             def a_load(mi, ks, _base=cur_off):
-                return a_s2r.load_operand(a_buf, mi, ks, _base)
+                return a_s2r.load_operand_in_flight(a_buf, mi, ks, _base)
 
             if const_expr(async_a_copy):
                 rocdl.sched_barrier(0)
@@ -1196,7 +1711,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_row_base)
+        if const_expr(row_map is not None):
+            a_scale.stage(a_scale_lds, tile_row_base, row_map, None, s_srcs)
+        else:
+            a_scale.stage(a_scale_lds, tile_row_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         init = [mfma.zero_value for _ in range(N_ACC)]
         for sp_i, state in range(0, K_ITERS, 1, init=init):
@@ -1249,7 +1767,8 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 # fmt: off
 @flyc.jit
 def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
-    a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA):
+    a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA, row_map=None,
+    meta=None, a_ahead=1):
 # fmt: on
     """pipe_weights K-loop with B / B-scale issued LA K-steps ahead, unrolled xLA.
 
@@ -1259,19 +1778,32 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     iteration, so the yielded sets coalesce with the loop arguments and loads stay in flight across the back-edge.
     Per-accumulator MFMA order (ksub 0 then 1, K-steps ascending) is unchanged -> bit-identical output.
     B-scale loads and epilogue stores are nt; the epilogue stores are clamped to the tile's valid rows.
+    a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
+    k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
     """
+    assert 1 <= a_ahead < K_ITERS
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B = NUM_ACC_N * _PACK
     NUM_SB = NUM_ACC_N // _PACK
     sb_cm = 3
-    tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, _raw(_buffer_load(trb_rsrc, m_tile, fx.Int32))))
-    b_row = sched.gate_base_row(expert) + n_tile_base
     valid_rows = None
-    if const_expr(rows_rsrc is not None):
+    if const_expr(meta is not None):
+        tile_row_base, valid_rows = meta
+    else:
+        tile_row_base = fx.Int32(rocdl.readfirstlane(T.i32, _raw(_buffer_load(trb_rsrc, m_tile, fx.Int32))))
+    b_row = sched.gate_base_row(expert) + n_tile_base
+    if const_expr(meta is None and rows_rsrc is not None):
         valid_rows = fx.Int32(rocdl.readfirstlane(T.i32, _raw(_buffer_load(rows_rsrc, m_tile, fx.Int32))))
-    a_gather.for_tile(tile_row_base, valid_rows)
-    a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
-    a_scale.stage(a_scale_lds, tile_row_base)
+    if const_expr(row_map is not None):
+        a_srcs = a_gather.load_row_map(tile_row_base, row_map["srcmap"])
+        s_srcs = a_scale.load_row_map(tile_row_base, row_map["srcmap"])
+        a_gather.for_tile(tile_row_base, valid_rows, row_map, a_srcs)
+        a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
+        a_scale.stage(a_scale_lds, tile_row_base, row_map, valid_rows, s_srcs)
+    else:
+        a_gather.for_tile(tile_row_base, valid_rows)
+        a_gather.store(a_buf, a_gather.load_regs(fx.Int32(0)), fx.Int32(0))
+        a_scale.stage(a_scale_lds, tile_row_base)
     wait_lds_barrier(63)
     init = [mfma.zero_value for _ in range(N_ACC)]
     for q in range_constexpr(LA):
@@ -1279,6 +1811,8 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     for q in range_constexpr(LA):
         init += b_scale.load_step(b_row, fx.Int32(q), sb_cm)
     a_lds_bytes = [lb for lb, _c in a_gather._chunks]
+    # a_ahead > 1: A register sets of K-steps k+1 .. k+a_ahead-1 (only in the unrolled K-loop).
+    aq = [[v for _lb, v in a_gather.load_regs(fx.Int32(j * A_K_STEP_BYTES))] for j in range_constexpr(1, a_ahead)]
 
     def unpack(state):
         acc = [Vec(a) for a in state[:N_ACC]]
@@ -1298,15 +1832,22 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             out += list(sb)
         return out
 
-    def step(sp, acc, bq, sbq, issue, a_next):
+    def step(sp, acc, bq, sbq, issue, a_next, a_issue=False):
         cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
         nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
         kl = sp + fx.Int32(LA)
+        if const_expr(a_issue):
+            aq.append([v for _lb, v in a_gather.load_regs((sp + fx.Int32(a_ahead)) * fx.Int32(A_K_STEP_BYTES))])
         sb_new = b_scale.load_step(b_row, kl, sb_cm) if issue else None
         sa = a_scale.load_step(a_scale_lds, sp)
         a_regs = None
         if const_expr(a_next):
-            a_regs = [v for _lb, v in a_gather.load_regs((sp + fx.Int32(1)) * fx.Int32(A_K_STEP_BYTES))]
+            if const_expr(a_ahead > 1):
+                # Opaque to LLVM, which would otherwise fold the load + LDS write into an LDS DMA issued here.
+                v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+                a_regs = [Vec(llvm.inline_asm(v4, [_raw(v)], "", "=v,0", has_side_effects=True)) for v in aq.pop(0)]
+            else:
+                a_regs = [v for _lb, v in a_gather.load_regs((sp + fx.Int32(1)) * fx.Int32(A_K_STEP_BYTES))]
 
         def a_load(mi, ks, _base=cur_off):
             return a_s2r.load_operand(a_buf, mi, ks, _base)
@@ -1327,16 +1868,21 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
             wait_lds_barrier()
         return acc, bq, sbq
 
-    n_loop = (K_ITERS - LA) // LA
-    for it_i, state in range(0, n_loop, 1, init=init):
-        sp0 = fx.Int32(it_i) * fx.Int32(LA)
-        acc, bq, sbq = unpack(state)
-        for u in range_constexpr(LA):
-            acc, bq, sbq = step(sp0 + fx.Int32(u), acc, bq, sbq, True, True)
-        state = yield pack(acc, bq, sbq)
+    # a_ahead > 1 unrolls every K-step: a loop would rotate the register queues through phi copies, which wait for
+    # the loads still in flight.
+    n_loop = 0 if a_ahead > 1 else (K_ITERS - LA) // LA
+    state = init
+    if const_expr(n_loop > 0):
+        for it_i, state in range(0, n_loop, 1, init=init):
+            sp0 = fx.Int32(it_i) * fx.Int32(LA)
+            acc, bq, sbq = unpack(state)
+            for u in range_constexpr(LA):
+                acc, bq, sbq = step(sp0 + fx.Int32(u), acc, bq, sbq, True, True)
+            state = yield pack(acc, bq, sbq)
     acc, bq, sbq = unpack(state)
     for k in range_constexpr(n_loop * LA, K_ITERS):
-        acc, bq, sbq = step(fx.Int32(k), acc, bq, sbq, k + LA <= K_ITERS - 1, k < K_ITERS - 1)
+        acc, bq, sbq = step(fx.Int32(k), acc, bq, sbq, k + LA <= K_ITERS - 1, k < K_ITERS - 1,
+            a_ahead > 1 and k + a_ahead <= K_ITERS - 1)
     wait_lds_barrier()
     epi.store(acc, m_tile, tile_row_base, n_tile_base, valid_rows, 3)
 
@@ -1347,9 +1893,18 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
-    use_tile_resource, swiglu_limit=0.0, rows_rsrc=None, lookahead=0, out_cache_modifier=0):
+    use_tile_resource, swiglu_limit=0.0, rows_rsrc=None, lookahead=0, out_cache_modifier=0, row_map=None,
+    short_rows=0, fold_rows=0, epi_evec=2, a_asm_reads=False, ascale_packed=False, epi_lean=0, plan_lookup=None,
+    a_ahead=1):
     # fmt: on
-    """Build the GEMM1 atoms and return its expert resolver and tile runner."""
+    """Build the GEMM1 atoms and return its expert resolver and tile runner.
+
+    short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
+    computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
+    fold_rows > 0 also returns a runner for an m-tile followed by a tail tile of its expert with at most
+    fold_rows real rows: one sort_block_m + fold_rows row tile (the rows are contiguous) storing both.
+    """
+    assert row_map is None or lookahead > 0 or (async_a_copy and a_k_step_bytes == 256)
     sched = TileScheduler(
         expert_rsrc=expert_rsrc,
         inter_dim=inter_dim,
@@ -1362,7 +1917,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
         x_tensor=x_tensor, async_copy=async_a_copy)
     # fmt: on
-    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
+    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, asm_reads=a_asm_reads)
     b_loader = BWeightLoader(
         w_rsrc=w_rsrc,
         num_acc_n=num_acc_n,
@@ -1376,13 +1931,14 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         model_dim=model_dim,
         sort_block_m=sort_block_m,
         total_threads=total_threads,
+        packed=ascale_packed,
     )
     mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
     # fmt: off
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None, out_cache_modifier=out_cache_modifier)
+        out_tensor=out_tensor if use_tile_resource else None, out_cache_modifier=out_cache_modifier, evec=epi_evec, lean=epi_lean)
     # fmt: on
 
     def _decode(flat):
@@ -1397,22 +1953,100 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     def do_scheduled_tile(flat):
         m_tile, n_tile = _decode(flat)
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
-        expert = sched.expert_of(m_tile)
+        meta = None
+        if const_expr(plan_lookup is not None):
+            # (local expert, tile row base, valid rows) from the CTA's own plan.
+            expert, trb, rows = plan_lookup(m_tile)
+            meta = (trb, rows)
+        else:
+            expert = sched.expert_of(m_tile)
         # fmt: off
         if const_expr(lookahead > 0):
             assert pipe_weights and not async_a_copy and not mfma_amajor
             do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
                 a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, rows_rsrc,
-                lookahead)
+                lookahead, row_map, meta, a_ahead)
             return
+        assert plan_lookup is None
         do_tile(m_tile, n_tile_base, expert, sched, a_gather,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, rows_rsrc)
+            trb_rsrc, rows_rsrc, row_map)
         # fmt: on
 
-    return expert_of_flat, do_scheduled_tile
+    if const_expr(not short_rows):
+        return expert_of_flat, do_scheduled_tile
+    assert lookahead == 0 and rows_rsrc is None and sort_block_m % short_rows == 0
+    s_repeat = short_rows // 16
+    # fmt: off
+    a_gather_s = ATileLoader(row_bytes=model_dim, sort_block_m=short_rows, k_step_bytes=a_k_step_bytes,
+        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy)
+    a_scale_s = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=s_repeat, model_dim=model_dim, sort_block_m=short_rows,
+        total_threads=total_threads, packed=ascale_packed)
+    mfma_s = MfmaScaleGU(m_repeat=s_repeat, num_acc_n=num_acc_n)
+    epi_s = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
+        inter_dim=inter_dim, m_repeat=s_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
+        num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
+        out_tensor=out_tensor if use_tile_resource else None, out_cache_modifier=out_cache_modifier,
+        tile_rows=short_rows, evec=epi_evec, lean=epi_lean)
+    # fmt: on
+
+    def do_short_tile(flat):
+        m_tile, n_tile = _decode(flat)
+        n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
+        expert = sched.expert_of(m_tile)
+        # fmt: off
+        do_tile(m_tile, n_tile_base, expert, sched, a_gather_s, a_s2r, b_loader, b_scale, a_scale_s, mfma_s, epi_s,
+            a_buf, a_scale_lds, a_lds_i32, k_iters, s_repeat, num_acc_n, a_k_step_bytes, pipe_weights, mfma_amajor,
+            async_a_copy, trb_rsrc, rows_rsrc, row_map)
+        # fmt: on
+
+    if const_expr(not fold_rows):
+        return expert_of_flat, do_scheduled_tile, do_short_tile
+    assert async_a_copy and pipe_weights and fold_rows in (16, short_rows)
+    f_repeat = (sort_block_m + fold_rows) // 16
+    # A and its scales are staged in whole 32-row groups (rows past the tail are its padding).
+    f_rows = sort_block_m + short_rows
+    # fmt: off
+    a_gather_f = ATileLoader(row_bytes=model_dim, sort_block_m=f_rows, k_step_bytes=a_k_step_bytes,
+        total_threads=total_threads, swizzle=swizzle_a, x_tensor=x_tensor, async_copy=async_a_copy)
+    a_scale_f = AScaleLoader(scale_rsrc=sx_rsrc, m_repeat=f_rows // 16, model_dim=model_dim, sort_block_m=f_rows,
+        total_threads=total_threads, packed=ascale_packed)
+    mfma_f = MfmaScaleGU(m_repeat=f_repeat, num_acc_n=num_acc_n)
+    epi_t = epi_s if fold_rows == short_rows else SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc,
+        sorted_rsrc=trb_rsrc, tokens=0, inter_dim=inter_dim, m_repeat=fold_rows // 16, num_acc_n=num_acc_n,
+        sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit,
+        always_valid=True, out_tensor=out_tensor if use_tile_resource else None,
+        out_cache_modifier=out_cache_modifier, tile_rows=fold_rows, evec=epi_evec, lean=epi_lean)
+    # fmt: on
+    epi_f = _FoldEpilogue(epi, epi_t, m_repeat * num_acc_n, sort_block_m)
+
+    def do_fold_tile(flat):
+        m_tile, n_tile = _decode(flat)
+        n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
+        expert = sched.expert_of(m_tile)
+        # fmt: off
+        do_tile(m_tile, n_tile_base, expert, sched, a_gather_f, a_s2r, b_loader, b_scale, a_scale_f, mfma_f, epi_f,
+            a_buf, a_scale_lds, f_rows * a_k_step_bytes // 4, k_iters, f_repeat, num_acc_n, a_k_step_bytes,
+            pipe_weights, mfma_amajor, async_a_copy, trb_rsrc, rows_rsrc, row_map)
+        # fmt: on
+
+    return expert_of_flat, do_scheduled_tile, do_short_tile, do_fold_tile
+
+
+class _FoldEpilogue:
+    """Stores a folded tile: the head m-tile's accumulators, then the next m-tile's leading rows."""
+
+    def __init__(self, head, tail, head_accs, sort_block_m):
+        self._head, self._tail = head, tail
+        self._head_accs, self._sort_block_m = head_accs, sort_block_m
+
+    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):
+        # Each store ends with an LDS barrier, so the second may reuse the cshuffle LDS.
+        self._head.store(acc[: self._head_accs], tile_i32, tile_row_base_i32, n_tile_base_i32)
+        self._tail.store(acc[self._head_accs :], tile_i32 + fx.Int32(1),
+            tile_row_base_i32 + fx.Int32(self._sort_block_m), n_tile_base_i32)
 
 
 def scale_view(
@@ -1499,6 +2133,7 @@ def issue_a_load_lds_dt(
     BM=32,
     valid_rows=None,
     NW=4,
+    slot_rows=None,
 ):
     """Load one A tile through a tile-local descriptor so allocations may span the 4 GiB buffer ABI."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -1537,10 +2172,46 @@ def issue_a_load_lds_dt(
         )
         tile_row = lds_row + a_lane_row
         voffset = (lane_col ^ mask) + tile_row * K_BYTES
-        off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
+        off = fx.Int32(slot * ((BM if slot_rows is None else slot_rows) * KH_TILE_A)) + lds_row * KH_TILE_A
         v_e = (voffset + kt * KH_TILE_A) // 4  # per-lane i32-elem index
         fx.copy(
             atom, src[v_e, None], lds_dma_dst(base_i32, off, elem_ty=T.i32, align=16)
+        )
+
+
+def issue_a_fold_rows_dt(arg_aq, s_aq_base, slot, kt, m_row, wave, lane, KH_TILE_A, K_BYTES, valid_rows, *, BM,
+    slot_rows):
+    """fp8 A rows BM..BM+15 of a folded GEMM2 unit: each wave copies 4 rows (waves 4-7 repeat waves 0-3); rows past
+    valid_rows are out of bounds (no memory traffic), so every unit issues the same copies."""
+    lanes_per_row = KH_TILE_A // 16
+    lds_row = BM + (wave % fx.Int32(4)) * fx.Int32(64 // lanes_per_row)
+    tile_row = lds_row + lane // lanes_per_row
+    src = flat_buffer_view(fx.Int64(arg_aq) + fx.Int64(m_row) * fx.Int64(K_BYTES), None, T.i32, align=16,
+        elem_bytes=4, fold=False, num_records_bytes=fx.Int64(valid_rows) * fx.Int64(K_BYTES))
+    voffset = (((lane % lanes_per_row) * 16) ^ lds_swizzle_mask_f8(tile_row, KH_TILE_A)) + tile_row * K_BYTES
+    off = fx.Int32(slot * (slot_rows * KH_TILE_A)) + lds_row * fx.Int32(KH_TILE_A)
+    fx.copy(lds_dma_atom_128(), src[(voffset + kt * KH_TILE_A) // 4, None],
+        lds_dma_dst(s_aq_base, off, elem_ty=T.i32, align=16))
+
+
+def issue_a_scale_lds_dt(arg_ascale, s_aq_base, lds_off, m_row, i32_inter, wave, lane, *, INTER_MAX, NW, chunks=2):
+    """Copy a 64-row m-block's A scales (two 32-row chunks x every K chunk, contiguous) to LDS at lds_off."""
+    kc_dw = fx.Int32(i32_inter) // fx.Int32(256) * fx.Int32(64)
+    src = flat_buffer_view(
+        fx.Int64(arg_ascale) + fx.Int64((m_row // fx.Int32(32)) * kc_dw) * fx.Int64(4),
+        None,
+        T.i32,
+        align=16,
+        elem_bytes=4,
+        fold=False,
+        num_records_bytes=fx.Int64(kc_dw * fx.Int32(4) * chunks),
+    )
+    for r in range_constexpr(-(-2 * (INTER_MAX // 256) * 256 // (NW * 1024))):
+        blk = fx.Int32(r * NW) + wave
+        fx.copy(
+            lds_dma_atom_128(),
+            src[(blk * fx.Int32(64) + lane) * fx.Int32(4), None],
+            lds_dma_dst(s_aq_base, fx.Int32(lds_off) + blk * fx.Int32(1024), elem_ty=T.i32, align=16),
         )
 
 
@@ -1576,8 +2247,17 @@ def gemm2_compute_v2(
     valid_rows=None,
     NW=4,
     early_b_load=False,
+    a_dma_uniform=False,
+    a_scale_lds=False,
+    fold_rows=0,
+    fold=None,
 ):
-    """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+    """Run the GEMM2 K-loop and return accumulators for the selected epilogue.
+
+    fold_rows (16, BM64 1-stage with a_scale_lds): the A slots hold BM + fold_rows rows and, when the runtime flag
+    `fold` is set, the unit also computes rows BM..BM+15 (its expert's next m-block, a tail of at most 16 rows); their
+    accumulators come back as one more row group.
+    """
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -1593,7 +2273,8 @@ def gemm2_compute_v2(
     is_f8_a = a_dtype == "fp8"  # only the A path differs
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
-    slot_bytes = BM * KH_TILE_A
+    slot_rows = BM + fold_rows
+    slot_bytes = slot_rows * KH_TILE_A
     # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes (runtime)
@@ -1642,7 +2323,7 @@ def gemm2_compute_v2(
     )  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
     a_frags = [
         [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
-        for _ in range_constexpr(kMChunks)
+        for _ in range_constexpr(kMChunks + fold_rows // 16)
     ]
 
     def issue_a_load_lds(slot, kt):
@@ -1660,12 +2341,16 @@ def gemm2_compute_v2(
             BM=BM,
             valid_rows=valid_rows,
             NW=NW,
+            slot_rows=slot_rows,
         )
+        if const_expr(fold_rows):
+            issue_a_fold_rows_dt(arg_aq, s_aq_base, slot, kt, m_row, wave, lane, KH_TILE_A, K_BYTES,
+                fold.select(fx.Int32(BM + fold_rows), fx.Int32(BM)), BM=BM, slot_rows=slot_rows)
 
-    def issue_a_ds_read(slot):
+    def issue_a_ds_read(slot, chunks=None):
         # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
         for k in range_constexpr(kHalves):
-            for i in range_constexpr(kMChunks):
+            for i in (range_constexpr(kMChunks) if chunks is None else chunks):
                 lds_row = lane_mod_16 + i * 16
                 row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
                 if const_expr(is_f8_a):
@@ -1725,6 +2410,44 @@ def gemm2_compute_v2(
 
     ascale_views = [make_ascale_view(sub) for sub in range_constexpr(kScaleSubBlocks)]
     sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
+
+    # a_scale_lds: the m-block's A scales sit in LDS past the A slots (issue_a_scale_lds_dt). The reads are inline
+    # asm so the compiler sees no LDS read that could alias the in-flight A copy (it would wait for that copy).
+    as_lds_off = aStages * slot_bytes
+    # fold_rows: a third scale word (rows BM..BM+31, the folded tail) is read on every step (zeros unless folded).
+    n_sc = 3 if fold_rows else 2
+    v2i32 = ir.Type.parse("!llvm.struct<(" + ", ".join(["i32"] * n_sc) + ")>")
+    n_a_reads = kHalves * kMChunks * (2 if is_f8_a else 1)
+
+    def issue_a_scale_tile_lds(kt):
+        chunk_kt = (
+            kt
+            if const_expr(tilesPerScaleChunk == 1)
+            else kt // fx.Int32(tilesPerScaleChunk)
+        )
+        addr0 = s_aq_base + fx.Int32(as_lds_off) + (chunk_kt * fx.Int32(64) + lane) * fx.Int32(4)
+        assert kScaleSubBlocks == 2
+        pair = llvm.inline_asm(
+            v2i32,
+            [_raw(addr0 + kc_rt * fx.Int32(256 * k)) for k in range_constexpr(n_sc)],
+            "\n".join(f"ds_read_b32 ${k}, ${k + n_sc}" for k in range(n_sc)),
+            ",".join(["=&v"] * n_sc + ["v"] * n_sc),
+            has_side_effects=True,
+        )
+        return pair
+
+    def wait_a_scale_tile_lds(pair):
+        # LDS returns in order: once at most n_a_reads (<= 15, the A operand reads issued after) are left, both are back.
+        # The outputs are tied, so no use of the scales floats above the wait.
+        i32 = ir.IntegerType.get_signless(32)
+        w = llvm.inline_asm(
+            v2i32,
+            [llvm.extractvalue(i32, pair, [k]) for k in range(n_sc)],
+            f"s_waitcnt lgkmcnt({min(n_a_reads, 15)})",
+            ",".join(["=v"] * n_sc + [str(k) for k in range(n_sc)]),
+            has_side_effects=True,
+        )
+        return [fx.Int32(llvm.extractvalue(i32, w, [k])) for k in range_constexpr(n_sc)]
 
     def load_a_scale_tile(kt):
         # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
@@ -1863,20 +2586,21 @@ def gemm2_compute_v2(
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
+    kCChunks = kMChunks + fold_rows // 16
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
-        for _ in range_constexpr(kMChunks)
+        for _ in range_constexpr(kCChunks)
     ]
-    for i in range_constexpr(kMChunks):
+    for i in range_constexpr(kCChunks):
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
 
     def load_c_carry():
-        return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
+        return [c_frags[i][J].load() for i in range(kCChunks) for J in range(numAccN)]
 
     def store_c_carry(state):
         n = 0
-        for i in range_constexpr(kMChunks):
+        for i in range_constexpr(kCChunks):
             for J in range_constexpr(numAccN):
                 c_frags[i][J].store(state[n])
                 n += 1
@@ -1896,18 +2620,46 @@ def gemm2_compute_v2(
                 # Issue this K-tile's B and A-scale loads before the barrier and the next A-tile DMA:
                 # vmcnt retires in issue order, so waiting for them leaves that DMA in flight.
                 bqf, bsf = stream_b_tile(kt_rt)
-                sa = load_a_scale_tile(kt_rt)
+                if const_expr(not a_scale_lds):
+                    sa = load_a_scale_tile(kt_rt)
+            if const_expr(a_scale_lds):
+                # Step 0: the A-scale copy (older than the A preload) is done once only this step's B loads and
+                # the newest A copy are in flight; later steps have nothing older in flight (no wait).
+                fx.rocdl.s_waitcnt(vmcnt=numAccN * kHalves + nPairs + BM // NW // (64 // (KH_TILE_A // 16))
+                    + (1 if fold_rows else 0))
             gpu.barrier()
+            if const_expr(a_scale_lds):
+                sa_pair = issue_a_scale_tile_lds(kt_rt)
             issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            if const_expr(fold_rows):
+                # Before the next A copy is issued, so these LDS reads do not wait for it.
+                if fold:
+                    issue_a_ds_read(kt_rt % fx.Int32(aStages), chunks=[kMChunks])
             nxt = kt_rt + fx.Int32(kStages)
-            if nxt < K_TILES_RT:
+            if const_expr(a_dma_uniform):
+                # Every K-step issues its A copy (the last two re-read the last tile into a dead slot): with the
+                # copy conditional, the waitcnt merge of the copy-less path made the MFMAs wait for this copy.
+                last_kt = K_TILES_RT - fx.Int32(1)
+                issue_a_load_lds(nxt % fx.Int32(aStages), fx.Boolean(nxt < K_TILES_RT).select(nxt, last_kt))
+            elif nxt < K_TILES_RT:
                 issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
             if const_expr(not early_b_load):
                 bqf, bsf = stream_b_tile(kt_rt)
                 sa = load_a_scale_tile(kt_rt)
-            mfma_cluster(bqf, bsf, sa, kt_rt)
+            if const_expr(a_scale_lds):
+                sa = wait_a_scale_tile_lds(sa_pair)
+            mfma_cluster(bqf, bsf, sa[:kScaleSubBlocks], kt_rt)
+            if const_expr(fold_rows):
+                if fold:
+                    for J in range_constexpr(numAccN):
+                        mma_one_j(J, J % 2, shift_scale_word(sa[kScaleSubBlocks], kt_rt),
+                            shift_scale_word(Vec(bsf[J // 2].load())[0], kt_rt), bqf, a_frags, c_frags, mma_atoms,
+                            i0=kMChunks, single_rg=True, rg_off=0, k_halves=kHalves)
             results = yield load_c_carry()
         store_c_carry(results)
+        if const_expr(a_dma_uniform):
+            # The epilogue reuses the LDS the two trailing copies write.
+            wait_lds_barrier(0)
     else:
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = [
@@ -2048,7 +2800,7 @@ def gemm2_compute_v2(
 
     # Load the C fragments (fp8/fp4 unified onto the same fx.gemm path) and hand them to the epilog.
     accm_vecs = [
-        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
+        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kCChunks)
     ]
     return accm_vecs, m_row, n_block_idx, N_OUT_rt
 
