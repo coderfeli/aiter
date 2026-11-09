@@ -175,16 +175,14 @@ def compile_mixed_moe_gemm1_common(
     # (role 3): the leftover block of an expert holds few rows.
     half_body = half_lds_cell = None
     half_pong_bytes = half_ping_bytes = 0
-    use_half = __import__("os").environ.get("G1_HALF_TMP", "1") == "1"
     if pair_unified and _pair_role == 0:
         kw = {k: v for k, v in locals().items() if k in _GEMM1_KWARGS}
         pair_body, pair_lds_cell, pair_pong_bytes, pair_ping_bytes = (
             compile_mixed_moe_gemm1_common(**kw, _pair_role=1)
         )
-        if use_half:
-            half_body, half_lds_cell, half_pong_bytes, half_ping_bytes = (
-                compile_mixed_moe_gemm1_common(**kw, _pair_role=3)
-            )
+        half_body, half_lds_cell, half_pong_bytes, half_ping_bytes = (
+            compile_mixed_moe_gemm1_common(**kw, _pair_role=3)
+        )
         _pair_role = 2
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(

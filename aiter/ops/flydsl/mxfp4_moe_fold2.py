@@ -26,7 +26,6 @@ from aiter.ops.flydsl.kernels.mxfp4_moe_fold2.g2_port import compile_gemm2_a4w4_
 
 _BM = 16
 _BN = 256
-_BK = 256
 
 
 def _parse_config(config):
@@ -48,44 +47,15 @@ def _plan(tokens, model_dim, inter_dim, experts, topk, bn1, xcd1):
     max_sorted = (routes + min(routes, experts) * (_BM - 1) + _BM - 1) // _BM * _BM
     n_blocks = max_sorted // _BM
     stage1 = compile_gemm1_a4w4_fold(
-        _BM,
-        True,
-        True,
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
         NE=experts,
         TOPK=topk,
         BN=bn1,
-        BK=_BK,
-        interleave=False,
         xcd_swizzle=xcd1,
-        kstages=2,
-        kastages=0,
-        fold=True,
         M_CONST=tokens,
-        splitk=1,
-        splitk_aux=(4, 5),
-        nfuse=1,
-        splitk_p16=0,
-        splitk_rows=min(tokens, _BM),
-        krot=0,
-        xbody=0,
-        xres=0,
-        splitk_rd=0,
-        item=0,
     )
-    stage2 = compile_gemm2_a4w4_port(
-        BM=_BM,
-        use_nt=True,
-        NE=experts,
-        N_OUT=model_dim,
-        epilog="atomic",
-        D_INTER=inter_dim,
-        D_INTER_REAL=None,
-        BN=_BN,
-        BK=_BK,
-        xcd_swizzle=0,
-    )
+    stage2 = compile_gemm2_a4w4_port(NE=experts, N_OUT=model_dim, D_INTER=inter_dim)
     grid1 = gemm1_grid(tokens, _BM, NE=experts, TOPK=topk, INTER=inter_dim, BN=bn1)
     assert grid1 == n_blocks * (2 * inter_dim // bn1)
     # intermediate e8m0 scales: max_sorted * 64 bytes in rows of inter_dim/32 bytes,

@@ -136,28 +136,15 @@ def mma_one_j(
     single_rg=False,
     rg_off=0,
     k_halves=2,
-    swap=False,
 ):
     """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
     an fx.gemm on i32 A/B frags (fp8 A = i32<8:1>, fp4 A = i32<4:1>), e8m0 words on scale_a/scale_b.
     sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte.
-    swap: B is the MFMA's A operand, so C comes out transposed (lane = row).
     """
     row_groups = (rg_off,) if const_expr(single_rg) else range(2)
     for k in range(k_halves):
         for im in row_groups:
             i = i0 if const_expr(single_rg) else i0 + im
-            if const_expr(swap):
-                fx.gemm(
-                    atoms[(2 * k + in_b, 2 * k + im)],
-                    c_frags[i][J],
-                    bq_frags_kt[J][k],
-                    a_frags[i][k],
-                    c_frags[i][J],
-                    scale_a=sb,
-                    scale_b=sa,
-                )
-                continue
             fx.gemm(
                 atoms[(2 * k + im, 2 * k + in_b)],
                 c_frags[i][J],
@@ -360,7 +347,6 @@ def gemm2_body_v2(
     g2_adist=kStages,
     reduce_store_cache_modifier=None,
     route_store_nt=False,
-    g2_tq=False,
     resolved_input_rows=(),
     output_n_base=0,
     output_width=None,
@@ -724,7 +710,6 @@ def gemm2_body_v2(
                         mma_atoms,
                         i0=2 * sub,
                         k_halves=kHalves,
-                        swap=g2_tq,
                     )
             if const_expr(interleave is not None and J > 0):
                 interleave[J - 1]()
@@ -794,12 +779,8 @@ def gemm2_body_v2(
             packed.append(frag.load()[0])
         return packed
 
-    if const_expr(g2_tq):
-        assert use_reduce and route_out_fp8 and g2_defer_weight and g2_scale_blk == 32
-        assert BN == 256 and not is_bm16 and not g2_jit_a and not nonatomic
-        assert a_dtype == b_dtype and not enable_bias and output_width is None
     g2_interleave = const_expr(
-        g2_bf16_lds and not nonatomic and output_width is None and not g2_tq
+        g2_bf16_lds and not nonatomic and output_width is None
     )
     g2_prefetch_ids = const_expr(
         g2_prefetch_ids
@@ -1074,23 +1055,6 @@ def gemm2_body_v2(
             expert_id=e,
             enable_bias=enable_bias,
         )
-    elif const_expr(g2_tq):
-        tq_fp8_epilog(
-            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
-            arg_out,
-            arg_stids,
-            m_row,
-            n_block_idx,
-            wave,
-            lane,
-            i32_M,
-            N_OUT_rt,
-            BM=BM,
-            BN=BN,
-            topk=topk,
-            g2_out_pitch_align=g2_out_pitch_align,
-            route_store_nt=route_store_nt,
-        )
     elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
@@ -1101,157 +1065,6 @@ def gemm2_body_v2(
         )
 
 
-def _pl_swap(op, a, b):
-    r = op(
-        llvm.StructType.get_literal([T.i32, T.i32]), _raw(a), _raw(b), False, False
-    )
-    return (
-        fx.Int32(llvm.extractvalue(T.i32, r, [0])),
-        fx.Int32(llvm.extractvalue(T.i32, r, [1])),
-    )
-
-
-def tq_fp8_epilog(
-    accm,
-    arg_out,
-    arg_stids,
-    m_row,
-    n_block_idx,
-    wave,
-    lane,
-    i32_M,
-    N_OUT,
-    *,
-    BM,
-    BN,
-    topk,
-    g2_out_pitch_align,
-    route_store_nt,
-):
-    """FP8 route rows (unweighted, per-32 e8m0) quantized from transposed C.
-
-    With swapped MFMA operands lane l holds row l%16 of each 16-row group and
-    columns J*16 + (l//16)*4 + 0..3. The 32-column amax is lane-local plus two
-    permlane swaps; a 4x4 lane transpose of the fp8 words then gives every lane
-    16 contiguous bytes of its row. Same bytes as the bf16 C-slab epilogue.
-    """
-    numAccN = (BN // 4) // 16
-    assert numAccN == 4, BN
-    r16 = lane % 16
-    q = lane // 16
-
-    def flat_buffer(arg, elem_ty, align):
-        ptr = global_typed_ptr(arg, elem_ty, align=align)
-        view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
-        return fx.rocdl.make_buffer_tensor(view, max_size=True)
-
-    stids = flat_buffer(arg_stids, T.i32, 4)
-    out_i32 = flat_buffer(arg_out, T.i32, 4)
-    out_i8_ptr = global_typed_ptr(arg_out, T.i8, align=1)
-    load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
-    store_atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy128b(_CPOL_NT)
-        if const_expr(route_store_nt)
-        else fx.rocdl.BufferCopy128b(),
-        Int32,
-    )
-    packed = []
-    for i in range_constexpr(BM // 16):
-        frag = fx.make_rmem_tensor(1, Int32)
-        fx.copy(load_i32, stids[None, m_row + fx.Int32(i * 16) + r16], frag)
-        packed.append(frag.load()[0])
-
-    row_pitch = N_OUT + _udiv(N_OUT, fx.Int32(32))
-    if const_expr(g2_out_pitch_align > 0):
-        al = fx.Int32(g2_out_pitch_align)
-        row_pitch = ((row_pitch + al - fx.Int32(1)) // al) * al
-    col0 = n_block_idx * BN + wave * (BN // 4)
-    msk = fx.full([2], 0x7FFF, Int16)
-    pk_ty = T.vec(2, T.i16)
-
-    for i in range_constexpr(BM // 16):
-        bf = []
-        for J in range_constexpr(numAccN):
-            v = Vec(accm[i][J])
-            bf.append(
-                [
-                    Vec.from_elements(
-                        [fx.Float32(v[2 * h]), fx.Float32(v[2 * h + 1])], Float32
-                    ).to(BFloat16)
-                    for h in range_constexpr(2)
-                ]
-            )
-        amax = []
-        for g in range_constexpr(2):
-            acc = None
-            for J in range_constexpr(2 * g, 2 * g + 2):
-                for h in range_constexpr(2):
-                    p = bf[J][h].bitcast(Int16) & msk
-                    acc = p if acc is None else Vec(_arith.maxui(_raw(acc), _raw(p)))
-            a0, a1 = fx.Int32(acc[0]) & fx.Int32(0xFFFF), fx.Int32(acc[1]) & fx.Int32(
-                0xFFFF
-            )
-            amax.append((a0 > a1).select(a0, a1))
-        pair = amax[0] | (amax[1] << fx.Int32(16))
-        for swap in (rocdl.permlane16_swap, rocdl.permlane32_swap):
-            # Swapping a value with itself leaves the xor-16/32 partner in one half.
-            x, y = _pl_swap(swap, pair, pair)
-            pair = Vec(
-                _arith.maxui(
-                    _raw(Vec.from_elements([x], Int32).bitcast(Int16)),
-                    _raw(Vec.from_elements([y], Int32).bitcast(Int16)),
-                )
-            ).bitcast(Int32)[0]
-        e8 = []
-        bs = []
-        for g in range_constexpr(2):
-            amax_bits = ((pair >> fx.Int32(16 * g)) & fx.Int32(0xFFFF)) << fx.Int32(16)
-            ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
-            e8m0 = ax_e - fx.Int32(_FP8_E8M0_SHIFT)
-            e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
-            e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
-            block_scale = (amax_bits == fx.Int32(0)).select(
-                fx.Float32(1.0),
-                fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32)),
-            )
-            e8.append(e8m0)
-            bs.append(_raw(block_scale))
-        words = []
-        for J in range_constexpr(numAccN):
-            w = _raw(fx.full([2], 0, fx.Int16))
-            for h in range_constexpr(2):
-                w = rocdl.cvt_scalef32_pk_fp8_bf16(
-                    pk_ty, w, _raw(bf[J][h]), bs[J // 2], h
-                )
-            words.append(Vec(w).bitcast(Int32)[0])
-        # 4x4 transpose over (lane quarter q, word J): afterwards word J of
-        # quarter q is quarter J's word q, i.e. columns q*16 + J*4 .. +3.
-        words[0], words[2] = _pl_swap(rocdl.permlane32_swap, words[0], words[2])
-        words[1], words[3] = _pl_swap(rocdl.permlane32_swap, words[1], words[3])
-        words[0], words[1] = _pl_swap(rocdl.permlane16_swap, words[0], words[1])
-        words[2], words[3] = _pl_swap(rocdl.permlane16_swap, words[2], words[3])
-
-        token_id = packed[i] & fx.Int32(0x00FFFFFF)
-        route_slot = packed[i] >> fx.Int32(24)
-        out_row = fx.Int64(token_id * fx.Int32(topk) + route_slot)
-        row_base = out_row * fx.Int64(row_pitch)
-        val_off = row_base + fx.Int64(col0 + q * fx.Int32(16))
-        sc_off = row_base + fx.Int64(N_OUT + _udiv(col0, fx.Int32(32)) + q)
-        sc_val = (q == fx.Int32(0)).select(e8[0], e8[1])
-
-        @flyc.jit
-        def store_if_valid(token_id, route_slot, val_off, sc_off, sc_val, words=words):
-            if (token_id < i32_M) & (route_slot < fx.Int32(topk)):
-                frag = fx.make_rmem_tensor(4, Int32)
-                frag.store(Vec.from_elements(words, Int32))
-                fx.copy(store_atom, frag, out_i32[None, val_off // fx.Int64(4)])
-                if q < fx.Int32(2):
-                    fx.ptr_store(sc_val.to(Int8), out_i8_ptr + sc_off)
-
-        store_if_valid(token_id, route_slot, val_off, sc_off, sc_val)
-
-
-# ---- Atomic bf16 epilogue (shared store path; gemm2 down-proj) ----
 def atomic_bf16_epilog(
     lds_acc_base,
     accm,

@@ -92,5 +92,6 @@ def moe_sorting_opus_quant_fwd(
     sort path only.
 
     An empty ``workspace`` selects a one-launch sort + quant instead (needs an
-    empty ``activation_scale``, <= 1024 experts and <= 36864 routes).
+    empty ``activation_scale``, <= 1024 experts and <= 393216 routes, a
+    multiple of 4).
     """

@@ -158,7 +158,6 @@ def compile_gemm2_a4w4_port(
     _composition=None,
     _reduce_store_cache_modifier=None,
     route_store_nt=False,
-    g2_tq=False,
     _input_row_resolver=None,
     _output_n_range=None,
     use_valid_token_count=False,
@@ -401,10 +400,6 @@ def compile_gemm2_a4w4_port(
     route_store_nt = bool(route_store_nt and route_out_fp8)
     if route_store_nt:
         out_tag += "_rnt"
-    g2_tq = bool(g2_tq and route_out_fp8 and use_reduce)
-    if g2_tq:
-        out_tag += "_tq"
-        g2_prefetch_ids = False
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
     valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
@@ -598,7 +593,6 @@ def compile_gemm2_a4w4_port(
                 mn_idx=mn_idx,
                 reduce_store_cache_modifier=_reduce_store_cache_modifier,
                 route_store_nt=route_store_nt,
-                g2_tq=g2_tq,
                 resolved_input_rows=resolved_input_rows,
                 output_n_base=output_n_base,
                 output_width=output_width,
@@ -938,7 +932,6 @@ def get_g2(
     use_valid_token_count=False,
     pair_list=False,
     route_store_nt=False,
-    g2_tq=False,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -981,7 +974,6 @@ def get_g2(
         use_valid_token_count,
         pair_list,
         route_store_nt,
-        g2_tq,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -1009,7 +1001,6 @@ def get_g2(
             use_valid_token_count=use_valid_token_count,
             pair_list=pair_list,
             route_store_nt=route_store_nt,
-            g2_tq=g2_tq,
         )
         G2_CACHE[key] = launch
     return launch
@@ -1165,10 +1156,6 @@ def mxfp4_moe_gemm2(
         str(out_dtype).strip().lower() == "fp8"
         and out.numel() * out.element_size() > _ROUTE_NT_MIN_BYTES
     )
-    # FP8 route rows quantized straight from transposed C (no bf16 C slab).
-    g2_tq = g2_prefetch_ids and os.environ.get("MXFP4_G2_TQ", "0") == "1"
-    if g2_tq:
-        g2_prefetch_ids = False
     launch = get_g2(
         BM,
         BN,
@@ -1191,7 +1178,6 @@ def mxfp4_moe_gemm2(
         use_valid_token_count=use_valid_token_count,
         pair_list=pair_list,
         route_store_nt=route_store_nt,
-        g2_tq=g2_tq,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if pair_list:
