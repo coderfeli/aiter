@@ -139,9 +139,53 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     clamp_shared: bool = True,
     v2_output_layout: bool = False,
+    _pair_role: int = 0,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
+    # Cached-B t64x128 a4w4 (large M): a same-expert pair of 64-row sort blocks
+    # runs a 128-row body (B loaded once for both, role 1), every other block
+    # the 64-row body (role 2). One launch walks a block-ordered work list, so
+    # an expert's pair and leftover stay adjacent and share B in L2. Measured
+    # a win only with few blocks per expert (GLM-5, 257 experts, inter 2048);
+    # 73 experts or inter <= 1024 got slower.
+    pair_unified = (
+        int(b_nt) == 0
+        and a_dtype == "fp4"
+        and b_dtype == "fp4"
+        and int(tile_m) == 64
+        and int(tile_n) == 128
+        and int(inter_dim) >= 2048
+        and int(experts) >= 256
+        and int(k_batch) == 1
+        and int(k_wave) == 1
+        and int(persist_m) == 1
+        and int(xcd_swizzle) == 0
+        and use_async_copy
+        and model_dim_pad == 0
+        and not a_scale_one
+        and not heterogeneous_b
+        and gate_mode is GateMode.SEPARATED
+    )
+    # Unpacked, not kept as a tuple: FlyDSL keys a captured tuple by repr(),
+    # which would put the emitter's address in the cache key.
+    pair_body = pair_lds_cell = None
+    pair_pong_bytes = pair_ping_bytes = 0
+    # A single whose valid rows fit in its first half runs a half-height body
+    # (role 3): the leftover block of an expert holds few rows.
+    half_body = half_lds_cell = None
+    half_pong_bytes = half_ping_bytes = 0
+    use_half = __import__("os").environ.get("G1_HALF_TMP", "1") == "1"
+    if pair_unified and _pair_role == 0:
+        kw = {k: v for k, v in locals().items() if k in _GEMM1_KWARGS}
+        pair_body, pair_lds_cell, pair_pong_bytes, pair_ping_bytes = (
+            compile_mixed_moe_gemm1_common(**kw, _pair_role=1)
+        )
+        if use_half:
+            half_body, half_lds_cell, half_pong_bytes, half_ping_bytes = (
+                compile_mixed_moe_gemm1_common(**kw, _pair_role=3)
+            )
+        _pair_role = 2
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
@@ -163,6 +207,10 @@ def compile_mixed_moe_gemm1_common(
     is_f4_b = b_dtype == "fp4"
     is_f8_b = b_dtype == "fp8"
     sort_block_m = tile_m
+    if _pair_role == 1:
+        tile_m = 2 * sort_block_m
+    elif _pair_role == 3:
+        tile_m = sort_block_m // 2
     num_waves = min(4, tile_n // 32)
     # K-wave groups reduce accumulators in LDS before the epilogue.
     num_n_waves = num_waves
@@ -266,6 +314,8 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
+    v2out_tag += "_pu" if _pair_role else ""
+    v2out_tag += "h" if half_body is not None else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -300,11 +350,32 @@ def compile_mixed_moe_gemm1_common(
     std_total = _al(std_pong_aligned, GLOBAL_ALIGN) + _al(std_ping, 128)
     lds_limit = {"gfx950": 163840, "gfx942": 65536}.get(gpu_arch, 0)
 
+    # t128x128 at 2 workgroups per CU: A is read from LDS just in time (no
+    # register copy of the next A tile, DMA one K tile ahead) and the epilogue
+    # output is split over both A buffers, so VGPR and LDS both fit two.
+    # Only for streamed (nt) B; with cached B (compute-bound M) one wave with
+    # register-prefetched A is faster.
+    jit_a = (
+        (int(b_nt) != 0 or _pair_role == 1)
+        and a_dtype == "fp4"
+        and is_f4_b
+        and not gate_up_interleave
+        and k_wave == 1
+        and not heterogeneous_b
+        and use_async_copy
+        and model_dim_pad == 0
+        and _use_cshuffle_epilog
+        and int(tile_m) == 128
+        and int(tile_n) == 128
+        and num_waves >= 2
+        and (klen // int(tile_k)) % 2 == 0
+        and klen // int(tile_k) >= 4
+    )
     split_lds_out = (
         k_wave == 1
         and lds_limit > 0
         and lds_out_bytes > 0
-        and std_total > lds_limit
+        and (std_total > lds_limit or jit_a)
         and num_waves >= 2
     )
 
@@ -425,9 +496,20 @@ def compile_mixed_moe_gemm1_common(
     pp_a_reads = [p["a_reads"] for p in pipe_phases]
     pp_b_loads = [p["b_loads"] for p in pipe_phases]
     pp_has_scale = [p["has_scale"] for p in pipe_phases]
+    jit_phase_k = [sorted({m[0] for m in ph}) for ph in pp_mfma]
 
     fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
+
+    _pu_lds = [None]
+    if _pair_role == 2:
+        pu_pong_bytes = max(pong_field_bytes, pair_pong_bytes, half_pong_bytes)
+        pu_ping_bytes = max(ping_field_bytes, pair_ping_bytes, half_ping_bytes)
+
+        @fx.struct
+        class _PairSmem:
+            pong: fx.Array[fx.Uint8, pu_pong_bytes, 16]
+            ping: fx.Array[fx.Uint8, pu_ping_bytes, 16]
 
     if True:
 
@@ -573,7 +655,10 @@ def compile_mixed_moe_gemm1_common(
                 pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
                 ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
 
-            _lds = fx.SharedAllocator().allocate(_MoeGemm1Smem).peek()
+            if const_expr(_pair_role):
+                _lds = _pu_lds[0]
+            else:
+                _lds = fx.SharedAllocator().allocate(_MoeGemm1Smem).peek()
             lds_x_pong = _lds.pong.ptr
             lds_x_ping = _lds.ping.ptr
             base_ptr_pong = lds_x_pong
@@ -633,6 +718,9 @@ def compile_mixed_moe_gemm1_common(
             sorted_w_rsrc = ptr_rsrc(arg_sorted_weights, sorted_nbytes_i32)
 
             eid_nbytes_idx = size_expert_ids_in * 4
+            if const_expr(_pair_role):
+                # arg_expert_ids is the work list: count + one entry per block.
+                eid_nbytes_idx = (size_expert_ids_in + 1) * 4
             eid_nbytes_i32 = fx.Int32(eid_nbytes_idx)
             expert_rsrc = ptr_rsrc(arg_expert_ids, eid_nbytes_i32)
             bias_rsrc = ptr_rsrc(arg_bias, bias_nbytes) if enable_bias else None
@@ -1377,6 +1465,28 @@ def compile_mixed_moe_gemm1_common(
 
                 single_b_pipe = mock_gate_only or gate_up_interleave
 
+                class JitATile:
+                    """A tile read from LDS one k slice at a time, on first use."""
+
+                    def __init__(self, lds_buffer):
+                        self.lds_buffer = lds_buffer
+                        self.slices = {}
+
+                    def read(self, k_r):
+                        if const_expr(k_r < k_unroll and k_r not in self.slices):
+                            self.slices[k_r] = [
+                                load_a_subtile(k_r, mi_r, self.lds_buffer)
+                                for mi_r in range_constexpr(m_repeat)
+                            ]
+
+                    def __getitem__(self, idx):
+                        k_r = idx // m_repeat
+                        self.read(k_r)
+                        self.slices = {
+                            k: v for k, v in self.slices.items() if k >= k_r
+                        }
+                        return self.slices[k_r][idx % m_repeat]
+
                 def compute_bmajor_mfma_phase(
                     all_a_tiles,
                     gate_b_single,
@@ -1463,6 +1573,7 @@ def compile_mixed_moe_gemm1_common(
                     prev_up_bs,
                     acc_gate,
                     acc_up,
+                    lds_cur=None,
                 ):
                     """One flatmm-style interleaved half-iteration (deep pipeline).
 
@@ -1491,6 +1602,10 @@ def compile_mixed_moe_gemm1_common(
                     abs_k_dma = body_k_base_idx + next_k_dma_py
                     if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
+                        if const_expr(jit_a):
+                            # The barrier's vmcnt counts the loads issued after
+                            # this DMA; keep the scale loads behind it.
+                            rocdl.sched_barrier(0)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
 
@@ -1508,6 +1623,16 @@ def compile_mixed_moe_gemm1_common(
                     a_all = {}
                     b_gate_all = {}
                     b_up_all = {}
+
+                    def read_a_phase(_p):
+                        regs = [None] * (k_unroll * m_repeat)
+                        for k_i in range_constexpr(len(jit_phase_k[_p])):
+                            k_r = jit_phase_k[_p][k_i]
+                            for mi_r in range_constexpr(m_repeat):
+                                regs[k_r * m_repeat + mi_r] = load_a_subtile(
+                                    k_r, mi_r, lds_cur
+                                )
+                        return regs
 
                     for _p in range_constexpr(pipe_n_phases):
                         if const_expr(pp_has_scale[_p]):
@@ -1566,13 +1691,19 @@ def compile_mixed_moe_gemm1_common(
                                 )
 
                         rocdl.sched_barrier(0)
-                        for a_j in range_constexpr(len(pp_a_reads[_p])):
-                            ak, ami = pp_a_reads[_p][a_j]
-                            a_all[(ak, ami)] = load_a_subtile(
-                                ak,
-                                ami,
-                                lds_read,
-                            )
+                        if const_expr(jit_a):
+                            # Read a k slice when a phase first needs it; the
+                            # other wave on the SIMD covers the ds_read latency.
+                            if const_expr(_p == 0 or jit_phase_k[_p] != jit_phase_k[_p - 1]):
+                                a_phase = read_a_phase(_p)
+                        else:
+                            for a_j in range_constexpr(len(pp_a_reads[_p])):
+                                ak, ami = pp_a_reads[_p][a_j]
+                                a_all[(ak, ami)] = load_a_subtile(
+                                    ak,
+                                    ami,
+                                    lds_read,
+                                )
                         rocdl.sched_barrier(0)
 
                         rocdl.s_setprio(1)
@@ -1598,7 +1729,7 @@ def compile_mixed_moe_gemm1_common(
                             as_off = ku128 * m_repeat_packed
                             bs_idx = ku128 * num_acc_n_packed + ni_packed_idx
                             compute_bmajor_mfma_phase(
-                                prev_a_tile,
+                                a_phase if jit_a else prev_a_tile,
                                 mk_single(prev_gate_w[k_idx], ni_idx),
                                 up_b_single,
                                 prev_asvs[as_off : as_off + m_repeat_packed],
@@ -1615,9 +1746,10 @@ def compile_mixed_moe_gemm1_common(
                         rocdl.sched_barrier(0)
 
                     cur_a_tile = []
-                    for k in range_constexpr(k_unroll):
-                        for mi in range_constexpr(m_repeat):
-                            cur_a_tile.append(a_all[(k, mi)])
+                    if const_expr(not jit_a):
+                        for k in range_constexpr(k_unroll):
+                            for mi in range_constexpr(m_repeat):
+                                cur_a_tile.append(a_all[(k, mi)])
 
                     cur_gate_w = []
                     cur_up_w = None if single_b_pipe else []
@@ -1718,7 +1850,9 @@ def compile_mixed_moe_gemm1_common(
 
                 k1 = body_k_base_idx + tile_k
                 rocdl.sched_barrier(0)
-                if const_expr(use_async_copy):
+                if const_expr(jit_a):
+                    pass
+                elif const_expr(use_async_copy):
                     prefetch_x_to_lds(k1, body_lds_x_ping)
                 else:
                     x_regs_prime = load_x_tile(k1)
@@ -1730,7 +1864,10 @@ def compile_mixed_moe_gemm1_common(
                     rocdl.s_waitcnt(0)
                 gpu.barrier()
                 rocdl.sched_barrier(0)
-                a_tile_pong = prefetch_full_a_from_lds(body_lds_x_pong)
+                if const_expr(jit_a):
+                    a_tile_pong = None
+                else:
+                    a_tile_pong = prefetch_full_a_from_lds(body_lds_x_pong)
 
                 rocdl.sched_barrier(0)
                 rocdl.s_waitcnt(6)
@@ -1753,6 +1890,14 @@ def compile_mixed_moe_gemm1_common(
                         next_k_load_2 = k_iv_py + tile_k * 2
                         next_k_dma_1 = k_iv_py + tile_k * 2
                         next_k_dma_2 = k_iv_py + tile_k * 3
+                        lds_cur_1 = lds_cur_2 = None
+                        lds_dma_1 = body_lds_x_pong
+                        lds_dma_2 = body_lds_x_ping
+                        if const_expr(jit_a):
+                            next_k_dma_1 = k_iv_py + tile_k
+                            next_k_dma_2 = k_iv_py + tile_k * 2
+                            lds_cur_1, lds_dma_1 = body_lds_x_pong, body_lds_x_ping
+                            lds_cur_2, lds_dma_2 = body_lds_x_ping, body_lds_x_pong
 
                         (
                             a_tile_ping,
@@ -1765,7 +1910,7 @@ def compile_mixed_moe_gemm1_common(
                             acc_up,
                         ) = interleaved_half(
                             body_lds_x_ping,
-                            body_lds_x_pong,
+                            lds_dma_1,
                             next_k_dma_1,
                             next_k_load_1,
                             a_tile_pong,
@@ -1776,6 +1921,7 @@ def compile_mixed_moe_gemm1_common(
                             up_bs_pong,
                             acc_gate,
                             acc_up,
+                            lds_cur=lds_cur_1,
                         )
 
                         (
@@ -1789,7 +1935,7 @@ def compile_mixed_moe_gemm1_common(
                             acc_up,
                         ) = interleaved_half(
                             body_lds_x_pong,
-                            body_lds_x_ping,
+                            lds_dma_2,
                             next_k_dma_2,
                             next_k_load_2,
                             a_tile_ping,
@@ -1800,8 +1946,17 @@ def compile_mixed_moe_gemm1_common(
                             up_bs_ping,
                             acc_gate,
                             acc_up,
+                            lds_cur=lds_cur_2,
                         )
 
+                if const_expr(jit_a):
+                    # Tile T-2 is in pong; ping still holds tile T-3 until
+                    # every wave is past its reads.
+                    a_tile_pong = JitATile(body_lds_x_pong)
+                    rocdl.sched_barrier(0)
+                    rocdl.s_waitcnt(body_vmcnt_before_barrier)
+                    barrier()
+                    rocdl.sched_barrier(0)
                 if const_expr(odd_k_tiles):
                     acc_gate, acc_up, epilogue_pf = compute_tile(
                         acc_gate,
@@ -1855,12 +2010,18 @@ def compile_mixed_moe_gemm1_common(
                     )
                     if const_expr(not use_async_copy):
                         store_x_tile_to_lds(x_regs_ping, body_lds_x_ping)
+                    if const_expr(jit_a):
+                        rocdl.sched_barrier(0)
                     rocdl.s_waitcnt(0)
                     barrier()
+                    if const_expr(jit_a):
+                        rocdl.sched_barrier(0)
                     if const_expr(pad_ku_skip > 0):
                         a_tile_ping = prefetch_full_a_from_lds(
                             body_lds_x_ping, ku_limit=tail_ku
                         )
+                    elif const_expr(jit_a):
+                        a_tile_ping = JitATile(body_lds_x_ping)
                     else:
                         a_tile_ping = prefetch_full_a_from_lds(body_lds_x_ping)
                     acc_gate, acc_up, epilogue_pf = compute_tile(
@@ -2646,6 +2807,38 @@ def compile_mixed_moe_gemm1_common(
                 _gemm1_dispatch()
                 gpu.barrier()
 
+            def _worklist_iter():
+                # Entry y = (block << 16) | (is_pair << 15) | (is_half << 14) | expert;
+                # y >= count idles.
+                nonlocal bx, bx_m, bx_m_i32, blk_valid
+                nonlocal expert_i32, expert_idx, exp_valid
+                count = buffer_ops.buffer_load(
+                    expert_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                )
+                packed = fx.Int32(
+                    buffer_ops.buffer_load(
+                        expert_rsrc, bx_persist + 1, vec_width=1, dtype=T.i32
+                    )
+                )
+                if const_expr(_pair_role == 1):
+                    role = (packed >> fx.Int32(15)) & fx.Int32(1)
+                elif const_expr(_pair_role == 3):
+                    role = (packed >> fx.Int32(14)) & fx.Int32(3)
+                elif const_expr(half_body is not None):
+                    role = (packed >> fx.Int32(14)) & fx.Int32(3)
+                else:
+                    role = (packed >> fx.Int32(15)) & fx.Int32(1)
+                blk_valid = (
+                    fx.Uint32(fx.Int32(bx_persist)) < fx.Uint32(count)
+                ) & (role == fx.Int32(1 if _pair_role in (1, 3) else 0))
+                bx = fx.Index(packed >> fx.Int32(16))
+                bx_m = bx * sort_block_m
+                bx_m_i32 = fx.Int32(bx_m)
+                expert_i32 = packed & fx.Int32(0x3FFF)
+                expert_idx = fx.Index(expert_i32)
+                exp_valid = fx.Uint32(expert_i32) < fx.Uint32(experts)
+                _gemm1_dispatch()
+
             c0_p = fx.Index(0)
             c1_p = fx.Index(1)
 
@@ -2657,7 +2850,13 @@ def compile_mixed_moe_gemm1_common(
                 for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
                     _persist_iter(mi_p)
 
-            _run_persist()
+            if const_expr(_pair_role):
+                _worklist_iter()
+            else:
+                _run_persist()
+
+    if _pair_role in (1, 3):
+        return _emit_moe_gemm1, _pu_lds, pong_field_bytes, ping_field_bytes
 
     if heterogeneous_b:
 
@@ -2736,6 +2935,59 @@ def compile_mixed_moe_gemm1_common(
             f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
         ):
+            if const_expr(_pair_role == 2):
+                _pu_lds[0] = fx.SharedAllocator().allocate(_PairSmem).peek()
+                pair_lds_cell[0] = _pu_lds[0]
+                pair_body(
+                    arg_out,
+                    arg_x,
+                    arg_w,
+                    arg_scale_x,
+                    arg_scale_w,
+                    arg_w,
+                    arg_scale_w,
+                    arg_sorted_token_ids,
+                    arg_expert_ids,
+                    arg_sorted_weights,
+                    arg_num_valid_ids,
+                    arg_bias,
+                    arg_out_scale_sorted,
+                    i32_tokens_in,
+                    i32_n_in,
+                    i32_k_in,
+                    i32_size_expert_ids_in,
+                    f32_situ_beta,
+                    f32_situ_beta_rcp,
+                    f32_situ_linear_beta,
+                    f32_situ_linear_beta_rcp,
+                    f32_swiglu_limit,
+                )
+                if const_expr(half_body is not None):
+                    half_lds_cell[0] = _pu_lds[0]
+                    half_body(
+                        arg_out,
+                        arg_x,
+                        arg_w,
+                        arg_scale_x,
+                        arg_scale_w,
+                        arg_w,
+                        arg_scale_w,
+                        arg_sorted_token_ids,
+                        arg_expert_ids,
+                        arg_sorted_weights,
+                        arg_num_valid_ids,
+                        arg_bias,
+                        arg_out_scale_sorted,
+                        i32_tokens_in,
+                        i32_n_in,
+                        i32_k_in,
+                        i32_size_expert_ids_in,
+                        f32_situ_beta,
+                        f32_situ_beta_rcp,
+                        f32_situ_linear_beta,
+                        f32_situ_linear_beta_rcp,
+                        f32_swiglu_limit,
+                    )
             _emit_moe_gemm1(
                 arg_out,
                 arg_x,
@@ -3004,7 +3256,16 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
+    if _pair_role == 2:
+        from .moe_pair_worklist import PairUnifiedLaunch
+
+        return PairUnifiedLaunch(launch_mixed_moe_gemm1, sort_block_m)
     return launch_mixed_moe_gemm1
+
+
+_GEMM1_KWARGS = frozenset(
+    __import__("inspect").signature(compile_mixed_moe_gemm1_common).parameters
+) - {"_pair_role"}
 
 
 def compile_mixed_moe_gemm2_common(

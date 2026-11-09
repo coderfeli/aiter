@@ -1553,7 +1553,25 @@ namespace py = pybind11;
           py::arg("activation_quant"),                 \
           py::arg("activation_scale_token"),           \
           py::arg("num_experts"),                      \
-          py::arg("num_local_tokens") = std::nullopt);
+          py::arg("num_local_tokens") = std::nullopt); \
+    m.def("moe_sorting_opus_quant_fwd",                \
+          &moe_sorting_opus_quant_fwd,                 \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("num_experts"),                      \
+          py::arg("unit_size"),                        \
+          py::arg("workspace"),                        \
+          py::arg("m_indices"),                        \
+          py::arg("reverse_sorted"),                   \
+          py::arg("hidden_states"),                    \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale_token"),           \
+          py::arg("activation_scale"));
 
 #define MQA_LOGITS_MXFP4_PYBIND                          \
     m.def("mqa_logits_mxfp4_instances",                  \

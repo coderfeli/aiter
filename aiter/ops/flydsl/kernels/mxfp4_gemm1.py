@@ -40,8 +40,52 @@ from .mxfp4_gemm_common import (
     kStages,
     lds_acc_bytes_for,
 )
+from .communication_ops_utils import atomic_add_agent, spin_until_ge_i32_agent
 
 ACC_LDS_PAD_DW = 4
+# Whole-K tiles of a fold_dpsk launch: one per CU.
+FOLD_DP_CTAS = 256
+
+
+# Decode stage 1 with the routing sort folded in (fold_tokens > 0). Every CTA
+# rebuilds the padded per-expert sort of the M*topk routes in LDS (histogram,
+# block scan, rank of its m-block's expert), so no separate sort launch and no
+# inter-CTA sync is needed; the n-block-0 CTA of each m-block publishes that
+# block's sorted ids/weights/expert id for stage 2 (m-block 0 also
+# num_valid_ids), and the whole grid zeroes the bf16 moe_buf for the atomic
+# stage 2. Padding rows carry token M (out of range: zero A, no store).
+# Sort scratch in LDS, in i32 words.
+_W_CNT = 0  # 272: routes per expert
+_W_WT = 272  # 16: per-wave scan totals
+_W_MISC = 288  # 16: [0] this m-block's expert, [1] its block index in the expert
+_W_ROWS = 304  # 16: token per row of this m-block
+_W_STOK = 320  # 16: sorted_token_ids of this m-block
+_W_WGT = 336  # 16: sorted_weights (f32 bits) of this m-block
+_W_END = 352
+
+
+def _lds_i32_tiles(base_ptr, word_off, n_words):
+    flat = fx.make_view(
+        fx.recast_iter(fx.Int32, fx.add_offset(base_ptr, word_off * 4)),
+        fx.make_layout(n_words, 1),
+    )
+    return fx.logical_divide(flat, fx.make_layout(1, 1))
+
+
+def _lds_atomic_add(tiles, idx):
+    atom = fx.make_copy_atom(fx.UniversalAtomicAdd(fx.Int32), fx.Int32)
+    r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+    r.store(fx.Vector.from_elements([fx.Int32(1)], fx.Int32))
+    fx.copy(atom, r, fx.slice(tiles, (None, idx)))
+
+
+def _dpp_scan_wave(x):
+    """64-lane inclusive add-scan (row shifts, then the row 15/31 broadcasts)."""
+    for ctrl in (0x111, 0x112, 0x114, 0x118):
+        x = x + fx.Int32(dpp_utils.update_dpp_i32(0, x, ctrl, 0xF, 0xF, True))
+    x = x + fx.Int32(dpp_utils.update_dpp_i32(0, x, 0x142, 0xA, 0xF, True))
+    x = x + fx.Int32(dpp_utils.update_dpp_i32(0, x, 0x143, 0xC, 0xF, True))
+    return x
 
 
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
@@ -95,6 +139,15 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    fold_e=None,
+    fold_rows=None,
+    k_parts=1,
+    k_part=None,
+    arg_part=None,
+    arg_flag=None,
+    part_scr=None,
+    part_slot=None,
+    tok_scale=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -102,7 +155,7 @@ def _gemm1_body(
     # A row bytes: fp4 = K/2, fp8 = K (B is always mxfp4 -> keeps K_HALF).
     A_ROW_BYTES = K if a_dtype == "fp8" else K_HALF
     K_TILES_TOTAL = K // BK
-    K_TILES_PER_WAVE = K_TILES_TOTAL // k_wave
+    K_TILES_PER_WAVE = K_TILES_TOTAL // k_wave // k_parts
     kAS_per_chunk_dw = kas_per_chunk_dw_for(K)
     ASCALE_CHUNK_BYTES = kAS_per_chunk_dw * 4
     kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)
@@ -145,7 +198,12 @@ def _gemm1_body(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(fold_e is not None):
+        e = fold_e
+    else:
+        e = rocdl.readfirstlane(
+            T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx))
+        )
     m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
@@ -156,6 +214,9 @@ def _gemm1_body(
     aq_num_records = fx.Int64(i32_ntok * fx.Int32(A_ROW_BYTES))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
+    if const_expr(tok_scale):
+        # arg_ascale is the token-order [ntok, K/32] E8M0 tensor.
+        ascale_num = fx.Int64(i32_ntok) * fx.Int64(K // 32)
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
@@ -188,7 +249,10 @@ def _gemm1_body(
     cached_row_inline = None
     if const_expr(inline_quant):
         rcls = wave_n * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+        if const_expr(fold_rows is not None):
+            cached_row_inline = _global_i32_load(fold_rows, rcls)
+        else:
+            cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
     elif const_expr(num_waves == 2):
         for load_group in range_constexpr(2):
             idx = (
@@ -237,6 +301,9 @@ def _gemm1_body(
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
         v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        if const_expr(k_parts > 1):
+            # Split K: this CTA owns K tiles [k_part * K_TILES_PER_WAVE, ...).
+            v = v + k_part * fx.Int32(K_TILES_PER_WAVE * 2048)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     if const_expr(interleave):
@@ -258,6 +325,8 @@ def _gemm1_body(
         base = (
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
+        if const_expr(k_parts > 1):
+            base = base + k_part * fx.Int32(K_TILES_PER_WAVE * kBS_stride_k0_dw * 4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
@@ -282,6 +351,13 @@ def _gemm1_body(
     s_aq_i32x1_tiles = fx.logical_divide(s_aq_i32_flat, mem_1x1)
     i32x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
 
+    def a_soff(kt):
+        off = fx.Int32(kt * KH_TILE)
+        if const_expr(k_parts > 1 and not inline_quant):
+            # Split K: this CTA's local K tile kt is global tile k_part * KTPW + kt.
+            off = off + k_part * fx.Int32(K_TILES_PER_WAVE * KH_TILE)
+        return off
+
     def issue_a_load_lds(slot, kt):
         # A wave-wide BufferCopyLDS128b writes 1024 contiguous bytes. That is
         # eight FP4 rows or four FP8 rows. Larger FP8 tiles use two four-row
@@ -302,7 +378,7 @@ def _gemm1_body(
                     aq_dma_atom,
                     fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
                     fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                    soffset=fx.Int32(kt * KH_TILE) // 4,
+                    soffset=a_soff(kt) // 4,
                 )
             return
         for sub in range_constexpr(kSubBlocks):
@@ -323,7 +399,7 @@ def _gemm1_body(
                         aq_dma_atom,
                         fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
                         fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                        soffset=fx.Int32(kt * KH_TILE) // 4,
+                        soffset=a_soff(kt) // 4,
                     )
             elif const_expr(a_dtype == "fp8"):
                 actual_row = cached_actual_row[sub]
@@ -348,7 +424,7 @@ def _gemm1_body(
                         aq_reg_atom,
                         fx.slice(aq_dma_tiles4, (None, src_off // fx.Int32(16))),
                         r,
-                        soffset=fx.Int32(kt * KH_TILE) // 4,
+                        soffset=a_soff(kt) // 4,
                     )
                     fx.copy(
                         i32x4_copy_atom,
@@ -369,7 +445,7 @@ def _gemm1_body(
                     aq_dma_atom,
                     fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
                     fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                    soffset=fx.Int32(kt * KH_TILE) // 4,
+                    soffset=a_soff(kt) // 4,
                 )
 
     # FP8 BM32 register staging, split in two so the ds_write can trail its global load
@@ -430,7 +506,7 @@ def _gemm1_body(
                 aq_reg_atom,
                 fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
                 r,
-                soffset=fx.Int32(kt * KH_TILE) // 4,
+                soffset=a_soff(kt) // 4,
             )
             regs.append(r)
         return regs
@@ -677,17 +753,115 @@ def _gemm1_body(
     asc_i32_tiles = fx.logical_divide(s_asc_i32_flat, mem_1x1)
     asc_i32x4_tiles = fx.logical_divide(s_asc_i32_flat, mem_4x1)
 
+    if const_expr(tok_scale):
+        asc_lane_hi, asc_lane_lo = lane_mod_16 * fx.Int32(4), lane_div_16
+    else:
+        asc_lane_hi, asc_lane_lo = lane_div_16 * fx.Int32(16), lane_mod_16
+
     def issue_a_scale_ds_read(kt):
         out = []
         for sub in range_constexpr(kSubBlocks):
             lds_dw = (
                 fx.Int32(sub * kAS_per_chunk_dw)
                 + fx.Int32(kt * 64)
-                + lane_div_16 * fx.Int32(16)
-                + lane_mod_16
+                + (
+                    k_part * fx.Int32(K_TILES_PER_WAVE * 64)
+                    if k_parts > 1 and not inline_quant
+                    else fx.Int32(0)
+                )
+                + asc_lane_hi
+                + asc_lane_lo
             )
             out.append(as_ir_value(_global_i32_load(asc_i32_tiles, lds_dw)))
         return out
+
+    TKS_ROW_BYTES = K // 32
+    # Pass ps covers K tiles [8 ps, 8 ps + 8) of every 32-row chunk.
+    TKS_PASS_KT = 8
+    TKS_PASSES = K_TILES_TOTAL // TKS_PASS_KT
+    if const_expr(tok_scale):
+        assert kSubBlocks in (1, num_waves) and K_TILES_TOTAL % TKS_PASS_KT == 0
+        # Four adjacent lanes read one row's 64 contiguous bytes.
+        r_tks = lane // fx.Int32(4) % fx.Int32(16)
+        g_tks = lane % fx.Int32(4)
+
+    def issue_a_scale_gather(ps, sub=None):
+        # Token-order scales: a lane owns rows r and r + 16 of one 32-row chunk
+        # and loads 16 B (two K tiles) of each row's scales.
+        ascale_tiles4 = _global_i32_buffer_tiles(arg_ascale, ascale_num, 4)
+        ascale_reg_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        # Wave w gathers chunk w: 64 contiguous bytes (K tiles 8 ps .. 8 ps + 7)
+        # of each of the chunk's 32 rows.
+        if const_expr(sub is None):
+            sub = wave_n
+        if const_expr(isinstance(ps, int)):
+            p = fx.Int32(ps * 4) + g_tks
+        else:
+            p = ps * fx.Int32(4) + g_tks
+        row = m_row + sub * fx.Int32(32) + r_tks
+        regs = []
+        for half in range_constexpr(2):
+            tok = _global_i32_at(arg_mind, row + fx.Int32(half * 16))
+            voff = tok * fx.Int32(TKS_ROW_BYTES) + p * fx.Int32(16)
+            t = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+            fx.copy(
+                ascale_reg_atom,
+                fx.slice(ascale_tiles4, (None, voff // fx.Int32(16))),
+                t,
+            )
+            regs.append(t)
+        return (sub, p, regs)
+
+    def commit_a_scale_gather(pend):
+        # Token-order LDS layout: word (chunk, kt, r, q) holds scale bytes
+        # kb = 8 kt + q (lo) and 8 kt + 4 + q (hi) of rows r and r + 16 as
+        # [lo r, lo r+16, hi r, hi r+16]; a lane writes its four q words at once.
+        sub, p, regs = pend
+        x = regs[0].load()
+        y = regs[1].load()
+        for h in range_constexpr(2):
+            x0, x1 = x[2 * h], x[2 * h + 1]
+            y0, y1 = y[2 * h], y[2 * h + 1]
+            kt = p * fx.Int32(2) + fx.Int32(h)
+            vals = []
+            for q in range_constexpr(4):
+                sh = fx.Int32(8 * q)
+                m = fx.Int32(0xFF)
+                vals.append(
+                    (x0.shrui(sh) & m)
+                    | ((y0.shrui(sh) & m) << fx.Int32(8))
+                    | ((x1.shrui(sh) & m) << fx.Int32(16))
+                    | ((y1.shrui(sh) & m) << fx.Int32(24))
+                )
+            t = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+            t.store(fx.Vector.from_elements(vals, fx.Int32))
+            dw = (
+                sub * fx.Int32(kAS_per_chunk_dw)
+                + kt * fx.Int32(64)
+                + r_tks * fx.Int32(4)
+            )
+            fx.copy(
+                i32x4_copy_atom,
+                t,
+                fx.slice(asc_i32x4_tiles, (None, dw // fx.Int32(4))),
+            )
+
+    def tks_prologue(wk=0):
+        if const_expr(kSubBlocks == num_waves):
+            return [issue_a_scale_gather(ps) for ps in range(TKS_PASSES)]
+        # One 32-row chunk: the CTA's waves (global id wk * num_waves + wave_n)
+        # share its passes; a surplus wave repeats a pass (same bytes, same LDS).
+        pend = []
+        for base in range_constexpr(wk * num_waves, TKS_PASSES, num_waves * k_wave):
+            ps = fx.Int32(base) + wave_n
+            if const_expr(base + num_waves > TKS_PASSES):
+                ps = ps % fx.Int32(TKS_PASSES)
+            pend.append(issue_a_scale_gather(ps, fx.Int32(0)))
+        return pend
+
+    def tks_commit(pend):
+        for one in pend:
+            commit_a_scale_gather(one)
 
     lib = lane & fx.Int32(3)
     lane_shr2_and3 = (lane >> fx.Int32(2)) & fx.Int32(3)
@@ -699,7 +873,10 @@ def _gemm1_body(
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
-        s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
+        s_soff = fx.Int32(kt * (BK * 2) + B128_IDX * 256)
+        if const_expr(k_parts > 1):
+            s_soff = s_soff + k_part * fx.Int32(K_TILES_PER_WAVE * BK * 2)
+        s_soff = rocdl.readfirstlane(T.i32, s_soff)
         r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
         fx.copy(
             hidden_copy_atom,
@@ -953,7 +1130,11 @@ def _gemm1_body(
     def run_k_slice_ksplit(global_k_tile):
         bh = [[None] * N_REPS for _ in range(2)]
         a_regs = [None] * a_reg_depth
-        issue_a_scale_load()
+        tks_pend = None
+        if const_expr(tok_scale):
+            tks_pend = tks_prologue()
+        else:
+            issue_a_scale_load()
         for S in range_constexpr(k_stages):
             issue_a_load_lds(S, global_k_tile(S))
         rocdl.sched_barrier(0)
@@ -965,6 +1146,8 @@ def _gemm1_body(
         for d in range_constexpr(a_reg_depth):
             if const_expr(k_stages + d < K_TILES_PER_WAVE):
                 a_regs[d] = issue_a_load_reg(global_k_tile(k_stages + d))
+        if const_expr(tok_scale):
+            tks_commit(tks_pend)
 
         for KT in range_constexpr(K_TILES_PER_WAVE):
             read_slot = KT % kAStages
@@ -1009,7 +1192,10 @@ def _gemm1_body(
         )
         # (slot, regs) of the A tile whose LDS write trails by one step
         a_pending = None
-        if const_expr(not inline_quant):
+        tks_pend = None
+        if const_expr(tok_scale):
+            tks_pend = tks_prologue(k_tile_base_const // K_TILES_PER_WAVE)
+        elif const_expr(not inline_quant):
             issue_a_scale_load()
         hidden_prefetch = None
         if const_expr(inline_quant and prefetch_hidden):
@@ -1058,6 +1244,22 @@ def _gemm1_body(
                         issue_b_load_j(b[K_C_LOCAL], K_C, j)
             if const_expr(not _relax_prologue):
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
+        # vmcnt retires in order: quantizing a hidden tile loaded in the same
+        # step would also drain every older B stage. BM16 loads hidden
+        # k_stages - 1 tiles ahead so the B pipeline stays full.
+        hidden_dist = (
+            k_stages - 1 if (inline_quant and not prefetch_hidden and BM == 16) else 0
+        )
+        hidden_ring = []
+        for d in range_constexpr(hidden_dist):
+            if const_expr(k_stages + d < K_TILES_PER_WAVE):
+                kt_n = global_k_tile(k_stages + d)
+                hidden_ring.append(
+                    (
+                        inline_quant_load_kt(0, kt_n, cached_row_inline),
+                        inline_quant_load_kt(1, kt_n, cached_row_inline),
+                    )
+                )
         if const_expr(_relax_prologue):
             rocdl.sched_barrier(0)
             for K_C_LOCAL in range_constexpr(k_stages):
@@ -1065,6 +1267,8 @@ def _gemm1_body(
                 for j in range_constexpr(N_REPS):
                     issue_b_load_j(b[K_C_LOCAL], K_C, j)
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
+        if const_expr(tok_scale):
+            tks_commit(tks_pend)
 
         for OFFSET in range_constexpr(kUnroll):
             K_C_LOCAL = k_stages + OFFSET
@@ -1107,8 +1311,16 @@ def _gemm1_body(
                 rocdl.sched_barrier(0)
                 issue_a_load_lds(write_slot, K_C)
             if const_expr(inline_quant and not prefetch_hidden):
-                h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-                h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
+                nxt = K_C_LOCAL + hidden_dist
+                if const_expr(nxt < K_TILES_PER_WAVE):
+                    kt_n = global_k_tile(nxt)
+                    hidden_ring.append(
+                        (
+                            inline_quant_load_kt(0, kt_n, cached_row_inline),
+                            inline_quant_load_kt(1, kt_n, cached_row_inline),
+                        )
+                    )
+                h_v0, h_v1 = hidden_ring.pop(0)
                 rocdl.sched_barrier(0)
             for J in range_constexpr(N_REPS):
                 if const_expr(BM != 128):
@@ -1222,45 +1434,47 @@ def _gemm1_body(
     def store_acc_split(split):
         for i_local in range_constexpr(CHUNKS_PER_SPLIT):
             i = split * CHUNKS_PER_SPLIT + i_local
-            row_base = fx.Int32(i_local * 16) + lane_div_16 * fx.Int32(4)
             for J in range_constexpr(N_REPS):
-                # Both weight layouts assign alternating gate/up tiles to the
-                # same accumulators, including BN64's pairs of adjacent waves.
-                if const_expr(BN == 64):
-                    if const_expr(num_waves == 2):
-                        gate_up = fx.Int32(J % 2)
-                        n16 = wave_n
-                        lds_col = (
-                            gate_up * fx.Int32(BN_INT)
-                            + n16 * fx.Int32(16)
-                            + lane_mod_16
-                        )
-                    else:
-                        gate_up = wave_n & fx.Int32(1)
-                        n16 = wave_n >> fx.Int32(1)
-                        lds_col = (
-                            gate_up * fx.Int32(BN_INT)
-                            + n16 * fx.Int32(16)
-                            + lane_mod_16
-                        )
-                else:
-                    is_up = (J % 2) == 1
-                    J_local = J // 2
-                    col_local = (
-                        wave_n * fx.Int32(BN // 8)
-                        + fx.Int32(J_local * 16)
-                        + lane_mod_16
-                    )
-                    lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
-                vec = fx.Vector(fx.memref_load_vec(accm[i][J]))
-                for v in range_constexpr(4):
-                    idx = acc_idx(wave_k, row_base + fx.Int32(v), lds_col)
-                    acc_store(idx, vec[v])
+                store_acc_vec(i_local, J, fx.Vector(fx.memref_load_vec(accm[i][J])))
+
+    def store_acc_vec(i_local, J, vec):
+        row_base = fx.Int32(i_local * 16) + lane_div_16 * fx.Int32(4)
+        # Both weight layouts assign alternating gate/up tiles to the
+        # same accumulators, including BN64's pairs of adjacent waves.
+        if const_expr(BN == 64):
+            if const_expr(num_waves == 2):
+                gate_up = fx.Int32(J % 2)
+                n16 = wave_n
+                lds_col = (
+                    gate_up * fx.Int32(BN_INT)
+                    + n16 * fx.Int32(16)
+                    + lane_mod_16
+                )
+            else:
+                gate_up = wave_n & fx.Int32(1)
+                n16 = wave_n >> fx.Int32(1)
+                lds_col = (
+                    gate_up * fx.Int32(BN_INT)
+                    + n16 * fx.Int32(16)
+                    + lane_mod_16
+                )
+        else:
+            is_up = (J % 2) == 1
+            J_local = J // 2
+            col_local = (
+                wave_n * fx.Int32(BN // 8)
+                + fx.Int32(J_local * 16)
+                + lane_mod_16
+            )
+            lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
+        for v in range_constexpr(4):
+            idx = acc_idx(wave_k, row_base + fx.Int32(v), lds_col)
+            acc_store(idx, vec[v])
 
     MR_PER_SPLIT = EPILOGUE_M_REPS // epi_splits
     scales_per_mr = [None] * EPILOGUE_M_REPS
 
-    def run_epilogue(split):
+    def run_epilogue(split, mr_range=None):
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
 
         def store_payload(payload_row, packed0, packed1):
@@ -1316,8 +1530,11 @@ def _gemm1_body(
                     arg_bias, bias_base + fx.Int32(inter) + out_col
                 )
 
-        for mr in range_constexpr(split * MR_PER_SPLIT, (split + 1) * MR_PER_SPLIT):
-            row_lds = fx.Int32((mr - split * MR_PER_SPLIT) * 16) + m_lane
+        # mr_range (tail split-K) addresses the full-height LDS tile.
+        lds_mr0 = 0 if mr_range else split * MR_PER_SPLIT
+        mr_range = mr_range or (split * MR_PER_SPLIT, (split + 1) * MR_PER_SPLIT)
+        for mr in range_constexpr(*mr_range):
+            row_lds = fx.Int32((mr - lds_mr0) * 16) + m_lane
             row_local = fx.Int32(mr * 16) + m_lane
 
             gate_vs = [None] * 8
@@ -1339,9 +1556,10 @@ def _gemm1_body(
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=swiglu_limit,
             )
-            if const_expr(out_dtype == "fp8"):
+            if const_expr(out_dtype == "fp8" or fold_rows is not None):
                 # Match the existing two-stage path: activation is materialized
-                # as BF16 before the inter-stage MXFP8 quantization.
+                # as BF16 before the inter-stage MXFP8 quantization (the fold
+                # decode path rounds to BF16 before MXFP4 too).
                 result = [value.to(fx.BFloat16).to(fx.Float32) for value in result]
 
             local_max = _fabs_f32(result[0])
@@ -1414,7 +1632,7 @@ def _gemm1_body(
                     fx.Int32(0),
                 )
 
-    def store_scales():
+    def store_scales(subs=None):
         # Generic scale chunks cover 32 sorted rows; native BM16 GEMM2 consumes
         # one padded chunk per M block. Derive the active runtime extent.
         num_scale_chunks = (
@@ -1493,7 +1711,7 @@ def _gemm1_body(
                     fx.Int8,
                 )
             else:
-                for sub in range_constexpr(kSubBlocks):
+                for sub in range_constexpr(*((0, kSubBlocks) if subs is None else subs)):
                     chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
                     dword_off = _layout_idx(
                         ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
@@ -1517,6 +1735,152 @@ def _gemm1_body(
             gpu.barrier()
             run_epilogue(split)
         store_scales()
+    elif const_expr(k_parts > 1 and kMChunks > 1):
+        # Tail split-K: every K part stores its fp32 tile, waits for the other
+        # parts, then sums its own 1/k_parts of the rows in part order
+        # (deterministic) and runs the epilogue for those rows only.
+        assert num_waves == 4 and k_wave == 1 and BN == 128
+        assert kMChunks % k_parts == 0
+        MR_PER_PART = kMChunks // k_parts
+        part_tiles = _global_i32_buffer_tiles(arg_part, 1 << 30, 4)
+        # The parts run on different XCDs (separate L2s): sc0|sc1 writes the
+        # partials through and reads them past this XCD's L2.
+        part_st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0x11), fx.Int32)
+        part_ld = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0x11), fx.Int32)
+        PART_STRIDE = kMChunks * N_REPS * 256
+
+        def part_idx(p, i, J):
+            return (part_slot * fx.Int32(k_parts) + p) * fx.Int32(
+                PART_STRIDE
+            ) + fx.Int32((i * N_REPS + J) * 256) + tx_i32
+
+        for i in range_constexpr(kMChunks):
+            for J in range_constexpr(N_REPS):
+                r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                r.store(fx.Vector(fx.memref_load_vec(accm[i][J])).bitcast(fx.Int32))
+                fx.copy(part_st, r, fx.slice(part_tiles, (None, part_idx(k_part, i, J))))
+        rocdl.s_waitcnt(vmcnt=0)
+        fx.memory_fence(
+            ordering=fx.AtomicOrdering.Release,
+            syncscope=fx.rocdl.SyncScope.WorkgroupOneAs,
+        )
+        gpu.barrier()
+        # Two counters per tile: arrivals (wait for all parts) and departures
+        # (the last part to leave resets both for the next launch).
+        arrive_addr = fx.Int64(arg_flag) + fx.Int64(part_slot) * fx.Int64(4)
+        depart_addr = arrive_addr + fx.Int64(TAIL_MAX_TILES * 4)
+        if tx_i32 == fx.Int32(0):
+            atomic_add_agent(arrive_addr, fx.Int32(1))
+            spin_until_ge_i32_agent(arrive_addr, fx.Int32(k_parts))
+        gpu.barrier()
+        fx.memory_fence(
+            ordering=fx.AtomicOrdering.Acquire,
+            syncscope=fx.rocdl.SyncScope.WorkgroupOneAs,
+        )
+
+        def finish_rows(p_own):
+            mr_lo = p_own * MR_PER_PART
+            mr_hi = mr_lo + MR_PER_PART
+            loaded = {}
+            for i in range_constexpr(mr_lo, mr_hi):
+                for J in range_constexpr(N_REPS):
+                    for p in range_constexpr(k_parts):
+                        r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                        fx.copy(
+                            part_ld,
+                            fx.slice(part_tiles, (None, part_idx(fx.Int32(p), i, J))),
+                            r,
+                        )
+                        loaded[(i, J, p)] = r
+            for i in range_constexpr(mr_lo, mr_hi):
+                for J in range_constexpr(N_REPS):
+                    total = None
+                    for p in range_constexpr(k_parts):
+                        v = fx.Vector(loaded[(i, J, p)].load()).bitcast(fx.Float32)
+                        total = v if total is None else total + v
+                    store_acc_vec(i, J, total)
+            gpu.barrier()
+            if tx_i32 == fx.Int32(0):
+                old = fx.Int32(atomic_add_agent(depart_addr, fx.Int32(1)))
+                if old == fx.Int32(k_parts - 1):
+                    atomic_add_agent(arrive_addr, fx.Int32(-k_parts))
+                    atomic_add_agent(depart_addr, fx.Int32(-k_parts))
+            if wave_grp < fx.Int32(2):
+                run_epilogue(0, mr_range=(mr_lo, mr_hi))
+                store_scales(subs=(mr_lo // 2, (mr_hi + 1) // 2))
+
+        # Each part's rows cover whole 32-row scale chunks (k_parts <= 4).
+        if const_expr(k_parts == 2):
+            if k_part == fx.Int32(0):
+                finish_rows(0)
+            else:
+                finish_rows(1)
+        else:
+            if k_part == fx.Int32(0):
+                finish_rows(0)
+            elif k_part == fx.Int32(1):
+                finish_rows(1)
+            elif k_part == fx.Int32(2):
+                finish_rows(2)
+            else:
+                finish_rows(3)
+    elif const_expr(k_parts > 1):
+        # Each K part stores its fp32 tile; the last part to arrive adds all parts
+        # in part order (deterministic) and runs the epilogue.
+        assert num_waves == 4 and k_wave == 1 and BN in (128, 256)
+        part_tiles = _global_i32_buffer_tiles(arg_part, 1 << 30, 4)
+        part_st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(4), fx.Int32)
+        part_ld = fx.make_copy_atom(fx.rocdl.BufferCopy128b(5), fx.Int32)
+        PART_STRIDE = N_REPS * 256
+
+        def part_idx(p, J):
+            return (bx_i32 * fx.Int32(k_parts) + p) * fx.Int32(PART_STRIDE) + fx.Int32(
+                J * 256
+            ) + tx_i32
+
+        for J in range_constexpr(N_REPS):
+            r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+            r.store(fx.Vector(fx.memref_load_vec(accm[0][J])).bitcast(fx.Int32))
+            fx.copy(part_st, r, fx.slice(part_tiles, (None, part_idx(k_part, J))))
+        rocdl.s_waitcnt(vmcnt=0)
+        fx.memory_fence(
+            ordering=fx.AtomicOrdering.Release,
+            syncscope=fx.rocdl.SyncScope.WorkgroupOneAs,
+        )
+        gpu.barrier()
+        flag_addr = fx.Int64(arg_flag) + fx.Int64(bx_i32) * fx.Int64(4)
+        if tx_i32 == fx.Int32(0):
+            old = fx.Int32(atomic_add_agent(flag_addr, fx.Int32(1)))
+            _scalar_store(part_scr, fx.Int32(2), old, fx.Int32)
+        gpu.barrier()
+        if _global_i32_load(part_scr, fx.Int32(2)) == fx.Int32(k_parts - 1):
+            fx.memory_fence(
+                ordering=fx.AtomicOrdering.Acquire,
+                syncscope=fx.rocdl.SyncScope.WorkgroupOneAs,
+            )
+            for J in range_constexpr(N_REPS):
+                total = None
+                for p in range_constexpr(k_parts):
+                    r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
+                    fx.copy(
+                        part_ld,
+                        fx.slice(part_tiles, (None, part_idx(fx.Int32(p), J))),
+                        r,
+                    )
+                    v = fx.Vector(r.load()).bitcast(fx.Float32)
+                    total = v if total is None else total + v
+                accm[0][J].store(total)
+            if tx_i32 == fx.Int32(0):
+                atomic_add_agent(flag_addr, fx.Int32(-k_parts))
+            store_acc_split(0)
+            gpu.barrier()
+            if const_expr(BN == 128):
+                if wave_grp < fx.Int32(2):
+                    run_epilogue(0)
+                    store_scales()
+            else:
+                run_epilogue(0)
+                store_scales()
     else:
         store_acc_split(0)
         gpu.barrier()
@@ -1552,11 +1916,31 @@ def _bm_constants(
 
 LDS_2WG_LIMIT = 65 * 1024
 
+# Tail split-K (tail_split > 1): 2 workgroups/CU x 256 gfx950 CUs per wave. A last
+# wave of up to TAIL_MAX_TILES tiles is split over tail_split CTAs per tile.
+TAIL_SLOTS = 512
+TAIL_MAX_TILES = 32
+TAIL_FLAG_BYTES = 256
+
+
+def tail_split_ws_bytes(BM, BN, tail_split):
+    return TAIL_FLAG_BYTES + TAIL_MAX_TILES * tail_split * BM * BN * 4
+
+
+def tail_split_extra_ctas(tail_split):
+    return TAIL_MAX_TILES * (tail_split - 1)
+
 MIN_N_BLOCKS_FOR_SHALLOW_K = 4
+
+# BM16 is the decode tile: the grid under-fills the CUs and B loads dominate,
+# so keep one more K tile of B in flight per wave.
+BM16_K_STAGES = 3
 
 
 def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits=1):
     """Pick the deepest K pipeline that still fits two workgroups per CU."""
+    if BM == 16 and k_wave == 1 and K_TILES_TOTAL >= 2 * BM16_K_STAGES:
+        return BM16_K_STAGES
     if N_OUT // BN < MIN_N_BLOCKS_FOR_SHALLOW_K:
         return kStages
     *_, lds = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, kStages)
@@ -1597,8 +1981,18 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    fold_tokens=0,
+    topk=0,
+    fold_dpsk=1,
+    tail_split=0,
+    tok_scale=False,
 ):
-    """Compile GEMM1 with expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output.
+
+    fold_tokens > 0 builds the decode variant that also does the routing sort
+    for exactly that many tokens (see the note above _W_CNT). fold_dpsk > 1 runs
+    the first FOLD_DP_CTAS tiles whole and splits the K loop of every later tile
+    over fold_dpsk CTAs, so a launch just over one tile per CU stays balanced."""
     try:
         _assert_supported(
             D_HIDDEN=D_HIDDEN,
@@ -1696,7 +2090,27 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if tail_split > 1:
+        assert BM == 128 and BN == 128 and k_wave == 1 and num_waves == 4
+        assert not inline_quant and not enable_bias and epi_splits == 1
+        assert tail_split in (2, 4) and D_HIDDEN // BK % tail_split == 0
+        name_suffix += f"_ts{tail_split}"
+    if tok_scale:
+        # A scales are read in token order (no sorted/shuffled scale copy).
+        assert a_dtype == "fp4" and not inline_quant and BK == 256
+        assert (BM, num_waves, k_wave) == (128, 4, 1) or (BM, num_waves) == (32, 2)
+        assert D_HIDDEN // BK % 8 == 0
+        name_suffix += "_tks"
 
+    if fold_tokens:
+        assert inline_quant and BM == 16 and num_waves == 4 and k_wave == 1
+        assert NE <= 257 and topk > 0 and not enable_bias
+        name_suffix += f"_fold{fold_tokens}"
+    if fold_dpsk > 1:
+        assert fold_tokens and BN in (128, 256) and epi_splits == 1
+        assert xcd_swizzle == 0 and D_HIDDEN // BK % fold_dpsk == 0
+        assert D_HIDDEN // BK // fold_dpsk >= 2
+        name_suffix += f"_dpsk{fold_dpsk}"
     block_threads = num_waves * k_wave * 64
 
     @fx.struct
@@ -1731,14 +2145,25 @@ def compile_gemm1_a4w4_port(
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+        n_whole = bound
+        n_tail = fx.Int32(0)
+        if const_expr(tail_split > 1):
+            # A last wave of at most TAIL_MAX_TILES tiles would run alone; split
+            # each of those tiles' K loop over tail_split CTAs instead.
+            n_tail = _umod(bound, TAIL_SLOTS)
+            n_tail = (n_tail <= fx.Int32(TAIL_MAX_TILES)).select(n_tail, fx.Int32(0))
+            n_whole = bound - n_tail
 
         NXCD = 8
-        xq = _udiv(bound, NXCD)
-        xr = _umod(bound, NXCD)
+        xq = _udiv(n_whole, NXCD)
+        xr = _umod(n_whole, NXCD)
 
         def _xcd(pid):
             xc = _umod(pid, NXCD)
             wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
+            return _xcd_group(wgid)
+
+        def _xcd_group(wgid):
             ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
             group_id = wgid // ng
             first_pid_m = group_id * fx.Int32(xcd_swizzle)
@@ -1750,11 +2175,15 @@ def compile_gemm1_a4w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
-        if bx_i32 < bound:
-            if const_expr(xcd_swizzle > 0):
-                tile = _xcd(bx_i32)
-            else:
-                tile = bx_i32
+        def run_body(tile, k_parts=1, k_part=None, part_slot=None):
+            part_args = {}
+            if const_expr(k_parts > 1):
+                # arg_bias carries the split-K workspace: flags, then partials.
+                part_args = dict(
+                    arg_part=fx.Int64(arg_bias) + fx.Int64(TAIL_FLAG_BYTES),
+                    arg_flag=arg_bias,
+                    part_slot=part_slot,
+                )
             _gemm1_body(
                 lds_raw_ptr,
                 arg_aq,
@@ -1793,8 +2222,39 @@ def compile_gemm1_a4w4_port(
                 num_waves=num_waves,
                 k_wave=k_wave,
                 epi_splits=epi_splits,
-                k_stages=k_stages,
+                k_stages=min(k_stages, K_TILES_TOTAL // k_parts),
+                k_parts=k_parts,
+                k_part=k_part,
+                tok_scale=tok_scale,
+                **part_args,
             )
+
+        if bx_i32 < n_whole:
+            if const_expr(xcd_swizzle > 0):
+                tile = _xcd(bx_i32)
+            else:
+                tile = bx_i32
+            run_body(tile)
+        if const_expr(tail_split > 1):
+            if bx_i32 >= n_whole:
+                j = bx_i32 - n_whole
+                t = j // fx.Int32(tail_split)
+                if t < n_tail:
+                    wg = n_whole + t
+                    if const_expr(xcd_swizzle > 0):
+                        tile = _xcd_group(wg)
+                    else:
+                        tile = wg
+                    run_body(
+                        tile,
+                        k_parts=tail_split,
+                        k_part=fx.Int32(
+                            rocdl.readfirstlane(
+                                T.i32, as_ir_value(j % fx.Int32(tail_split))
+                            )
+                        ),
+                        part_slot=t,
+                    )
 
     @flyc.jit
     def launch_gemm1(
@@ -1832,6 +2292,306 @@ def compile_gemm1_a4w4_port(
             block=(block_threads, 1, 1),
             stream=stream,
         )
+
+    if fold_tokens:
+        MT = fold_tokens * topk
+        NREP = (MT + 255) // 256
+        GRID = gemm1_grid(fold_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+        SK = fold_dpsk
+        if SK > 1 and GRID > FOLD_DP_CTAS:
+            # Tiles past FOLD_DP_CTAS: the SK parts of a tile run on one XCD
+            # (blocks FOLD_DP_CTAS + 8*SK*(j//8) + 8*p + j%8).
+            GRID = FOLD_DP_CTAS + (GRID - FOLD_DP_CTAS + 7) // 8 * 8 * SK
+        NDW = fold_tokens * D_HIDDEN // 2  # bf16 moe_buf as i32 words
+        NREP_Z = (NDW + GRID * 256 - 1) // (GRID * 256)
+
+        @fx.struct
+        class FoldStorage:
+            raw: fx.Array[fx.Uint8, lds_bytes, 16]
+            srt: fx.Array[fx.Uint8, _W_END * 4, 16]
+
+        @flyc.kernel(
+            name=f"gemm1_a4w4_port_{name_suffix}",
+            known_block_size=[block_threads, 1, 1],
+        )
+        def gemm1_kernel_fold(
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_aqout: fx.Int64,
+            arg_ascaleout: fx.Int64,
+            arg_hidden: fx.Int64,
+            arg_topk: fx.Int64,
+            arg_topkw: fx.Int64,
+            arg_stok: fx.Int64,
+            arg_swgt: fx.Int64,
+            arg_moebuf: fx.Int64,
+            arg_part: fx.Int64,
+            arg_flag: fx.Int64,
+        ):
+            smem = fx.SharedAllocator().allocate(FoldStorage).peek()
+            lds_raw_ptr = smem.raw.ptr
+            tx = fx.Int32(gpu.thread_id("x"))
+            bx = fx.Int32(gpu.block_id("x"))
+            lane = tx % 64
+            wave = rocdl.readfirstlane(T.i32, tx // 64)
+            cnt = _lds_i32_tiles(smem.srt.ptr, _W_CNT, 272)
+            wtot = _lds_i32_tiles(smem.srt.ptr, _W_WT, 16)
+            misc = _lds_i32_tiles(smem.srt.ptr, _W_MISC, 16)
+            rows = _lds_i32_tiles(smem.srt.ptr, _W_ROWS, 16)
+            stok = _lds_i32_tiles(smem.srt.ptr, _W_STOK, 16)
+            swgt = _lds_i32_tiles(smem.srt.ptr, _W_WGT, 16)
+
+            # Route ids/weights first; the moe_buf zeroing stores go behind them.
+            tk = []
+            tw = []
+            for r in range_constexpr(NREP):
+                i = tx + fx.Int32(r * 256)
+                live = i < fx.Int32(MT)
+                ic = live.select(i, fx.Int32(0))
+                tk.append(live.select(_global_i32_at(arg_topk, ic), fx.Int32(-1)))
+                tw.append(_global_i32_at(arg_topkw, ic))
+            moebuf = _global_scalar_tiles(arg_moebuf, fx.Int32, NDW)
+            for rz in range_constexpr(NREP_Z):
+                zi = bx * fx.Int32(256) + tx + fx.Int32(rz * GRID * 256)
+                if zi < fx.Int32(NDW):
+                    _scalar_store(moebuf, zi, fx.Int32(0), fx.Int32)
+            for r in range_constexpr(2):
+                ci = tx + fx.Int32(r * 256)
+                if ci < fx.Int32(272):
+                    _scalar_store(cnt, ci, fx.Int32(0), fx.Int32)
+            gpu.barrier()
+            for r in range_constexpr(NREP):
+                if tx + fx.Int32(r * 256) < fx.Int32(MT):
+                    _lds_atomic_add(cnt, tk[r])
+            gpu.barrier()
+
+            def block_scan(x):
+                # Exclusive prefix over the 256 threads, and the block total.
+                inc = _dpp_scan_wave(x)
+                gpu.barrier()
+                if lane == fx.Int32(63):
+                    _scalar_store(wtot, wave, inc, fx.Int32)
+                gpu.barrier()
+                w = [_global_i32_load(wtot, fx.Int32(j)) for j in range_constexpr(4)]
+                pref = fx.Int32(0)
+                for j in range_constexpr(3):
+                    pref = pref + (fx.Int32(j) < wave).select(w[j], fx.Int32(0))
+                return inc + pref - x, w[0] + w[1] + w[2] + w[3]
+
+            # Thread t owns expert t; expert 256 (the shared one) goes last.
+            nb = (_global_i32_load(cnt, tx) + fx.Int32(BM - 1)) >> fx.Int32(4)
+            nb256 = (
+                _global_i32_load(cnt, fx.Int32(256)) + fx.Int32(BM - 1)
+            ) >> fx.Int32(4)
+            excl, t256 = block_scan(nb)
+            gpu.barrier()
+            total_m_blocks = t256 + nb256
+            bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+
+            NXCD = 8
+            xq = _udiv(bound, NXCD)
+            xr = _umod(bound, NXCD)
+
+            def _xcd(pid):
+                xc = _umod(pid, NXCD)
+                wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
+                ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
+                group_id = wgid // ng
+                first_pid_m = group_id * fx.Int32(xcd_swizzle)
+                remaining_m = total_m_blocks - first_pid_m
+                sw = fx.Int32(xcd_swizzle)
+                group_size_m = (remaining_m < sw).select(remaining_m, sw)
+                wig = wgid % ng
+                m_block = first_pid_m + (wig % group_size_m)
+                n_block = wig // group_size_m
+                return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+
+            is_sk = fx.Int32(0)
+            part = fx.Int32(0)
+            tile_sk = bx
+            if const_expr(SK > 1):
+                sj = bx - fx.Int32(FOLD_DP_CTAS)
+                is_sk = (bx >= fx.Int32(FOLD_DP_CTAS)).select(fx.Int32(1), fx.Int32(0))
+                part = (is_sk == fx.Int32(1)).select(
+                    (sj % fx.Int32(8 * SK)) // fx.Int32(8), fx.Int32(0)
+                )
+                tile_sk = (is_sk == fx.Int32(1)).select(
+                    fx.Int32(FOLD_DP_CTAS)
+                    + sj // fx.Int32(8 * SK) * fx.Int32(8)
+                    + sj % fx.Int32(8),
+                    bx,
+                )
+            if tile_sk < bound:
+                if const_expr(xcd_swizzle > 0):
+                    tile = _xcd(bx)
+                else:
+                    tile = tile_sk
+                mbi = tile // fx.Int32(NUM_N_BLOCKS)
+                nbi = tile % fx.Int32(NUM_N_BLOCKS)
+                # Which expert owns this m-block, and its block index inside it.
+                if mbi >= excl:
+                    if mbi < excl + nb:
+                        _scalar_store(misc, fx.Int32(0), tx, fx.Int32)
+                        _scalar_store(misc, fx.Int32(1), mbi - excl, fx.Int32)
+                if tx == fx.Int32(0):
+                    if mbi >= t256:
+                        _scalar_store(misc, fx.Int32(0), fx.Int32(256), fx.Int32)
+                        _scalar_store(misc, fx.Int32(1), mbi - t256, fx.Int32)
+                if tx < fx.Int32(BM):
+                    _scalar_store(rows, tx, fx.Int32(fold_tokens), fx.Int32)
+                    _scalar_store(stok, tx, fx.Int32(fold_tokens), fx.Int32)
+                    _scalar_store(swgt, tx, fx.Int32(0), fx.Int32)
+                gpu.barrier()
+                fold_e = rocdl.readfirstlane(
+                    T.i32, as_ir_value(_global_i32_load(misc, fx.Int32(0)))
+                )
+                lo = _global_i32_load(misc, fx.Int32(1)) * fx.Int32(BM)
+
+                # Rank this expert's routes in route order; keep rows [lo, lo+BM).
+                base = fx.Int32(0)
+                for r in range_constexpr(NREP):
+                    i = tx + fx.Int32(r * 256)
+                    hit = (tk[r] == fold_e).select(fx.Int32(1), fx.Int32(0))
+                    rank, tot = block_scan(hit)
+                    d = base + rank - lo
+                    if hit == fx.Int32(1):
+                        if fx.Uint32(d) < fx.Uint32(BM):
+                            tok = i // fx.Int32(topk)
+                            slot = i % fx.Int32(topk)
+                            _scalar_store(rows, d, tok, fx.Int32)
+                            _scalar_store(
+                                stok, d, tok | (slot << fx.Int32(24)), fx.Int32
+                            )
+                            _scalar_store(swgt, d, tw[r], fx.Int32)
+                    base = base + tot
+                gpu.barrier()
+
+                # Publish this m-block's slice of the stage-2 sort tables.
+                if (nbi | part) == fx.Int32(0):
+                    if tx < fx.Int32(BM):
+                        sp = mbi * fx.Int32(BM) + tx
+                        stok_g = _global_scalar_tiles(arg_stok, fx.Int32, 1 << 24)
+                        swgt_g = _global_scalar_tiles(arg_swgt, fx.Int32, 1 << 24)
+                        _scalar_store(
+                            stok_g, sp, _global_i32_load(stok, tx), fx.Int32
+                        )
+                        _scalar_store(
+                            swgt_g, sp, _global_i32_load(swgt, tx), fx.Int32
+                        )
+                    if tx == fx.Int32(0):
+                        eids_g = _global_scalar_tiles(arg_eids, fx.Int32, 1 << 22)
+                        _scalar_store(eids_g, mbi, fold_e, fx.Int32)
+                        if mbi == fx.Int32(0):
+                            nv_g = _global_scalar_tiles(arg_cumsum, fx.Int32, 2)
+                            _scalar_store(
+                                nv_g,
+                                fx.Int32(0),
+                                total_m_blocks * fx.Int32(BM),
+                                fx.Int32,
+                            )
+                            _scalar_store(
+                                nv_g, fx.Int32(1), fx.Int32(fold_tokens), fx.Int32
+                            )
+
+                def run_body(k_parts, k_part):
+                    _gemm1_body(
+                        lds_raw_ptr,
+                        fx.Int64(0),
+                        fx.Int64(0),
+                        arg_bq,
+                        arg_bscale,
+                        arg_eids,
+                        fx.Int64(0),
+                        arg_aqout,
+                        arg_ascaleout,
+                        arg_hidden,
+                        fx.Int64(0),
+                        tile,
+                        lane,
+                        wave,
+                        use_nt,
+                        fx.Int32(fold_tokens),
+                        total_m_blocks,
+                        BM=BM,
+                        BN=BN,
+                        BK=BK,
+                        inline_quant=inline_quant,
+                        prefetch_hidden=prefetch_hidden,
+                        a_dtype=a_dtype,
+                        out_dtype=out_dtype,
+                        act=act,
+                        situ_beta=situ_beta,
+                        situ_linear_beta=situ_linear_beta,
+                        swiglu_limit=swiglu_limit,
+                        enable_bias=enable_bias,
+                        K=D_HIDDEN,
+                        N_OUT=N_OUT,
+                        NE=NE,
+                        interleave=interleave,
+                        native_scale_layout=native_scale_layout,
+                        num_waves=num_waves,
+                        k_wave=k_wave,
+                        epi_splits=epi_splits,
+                        k_stages=min(k_stages, D_HIDDEN // BK // k_parts),
+                        fold_e=fold_e,
+                        fold_rows=rows,
+                        k_parts=k_parts,
+                        k_part=k_part,
+                        arg_part=arg_part,
+                        arg_flag=arg_flag,
+                        part_scr=misc,
+                    )
+
+                if const_expr(SK > 1):
+                    if is_sk == fx.Int32(1):
+                        run_body(SK, part)
+                    else:
+                        run_body(1, None)
+                else:
+                    run_body(1, None)
+
+        @flyc.jit
+        def launch_gemm1_fold(
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_aqout: fx.Int64,
+            arg_ascaleout: fx.Int64,
+            arg_hidden: fx.Int64,
+            arg_topk: fx.Int64,
+            arg_topkw: fx.Int64,
+            arg_stok: fx.Int64,
+            arg_swgt: fx.Int64,
+            arg_moebuf: fx.Int64,
+            arg_part: fx.Int64,
+            arg_flag: fx.Int64,
+            stream: fx.Stream,
+        ):
+            gemm1_kernel_fold(
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_cumsum,
+                arg_aqout,
+                arg_ascaleout,
+                arg_hidden,
+                arg_topk,
+                arg_topkw,
+                arg_stok,
+                arg_swgt,
+                arg_moebuf,
+                arg_part,
+                arg_flag,
+            ).launch(
+                grid=(GRID, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+        launch_gemm1 = launch_gemm1_fold
 
     if k_stages == 1:
         launch_gemm1.compile_hints = {

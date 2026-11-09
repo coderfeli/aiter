@@ -597,6 +597,130 @@ def _mxfp4_inline_sort_unsupported(
     return ""
 
 
+def _opus_sort_quant_enabled(metadata, hidden_states, topk_ids, block_m):
+    """Fold MXFP4 prequant + scale sort into the Opus P23 launch.
+
+    Only for the prequant a4w4 path (fp4 MXMOE GEMM1, Opus aux sort, block_m
+    not 16) on the two-launch uint8-mesh multi-phase sort (tokens >= 512,
+    routes <= 36864 past 2048 tokens), or on the one-launch sort (routes <=
+    393216).
+    """
+    tokens, topk = topk_ids.shape
+    routes = tokens * topk
+    try:
+        stage1_fp4 = (
+            getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+            and _parse_mxfp4_g1_kname(metadata.stage1.keywords["kernelName1"])[
+                "a_dtype"
+            ]
+            == "fp4"
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return (
+        stage1_fp4
+        and metadata.output_aux == AUX_SORT_OPUS
+        and int(block_m) != 16
+        and hidden_states.dtype == dtypes.bf16
+        and hidden_states.is_contiguous()
+        and hidden_states.shape[1] % 1024 == 0
+        and hidden_states.shape[1] <= 8192
+        and tokens >= 512
+        and routes % 4 == 0
+        and (
+            tokens < 2048
+            or routes <= 36864
+            or (_stage1_one_launch_sort(metadata) and routes <= 393216)
+        )
+        and topk_ids.dtype == dtypes.i32
+        and get_gfx() == "gfx950"
+    )
+
+
+def _opus_sort_quant(
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    num_experts,
+    block_size,
+    moebuf_dtype,
+    accumulate,
+    output=None,
+    tok_scale=False,
+    one_launch=False,
+):
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    model_dim = hidden_states.shape[1]
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    max_num_tokens_padded = max_num_m_blocks * block_size
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    if accumulate:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    m_indices = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    # An empty workspace selects the one-launch sort (no sorted-scale output).
+    if one_launch:
+        ws_size = 0
+    else:
+        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+            M, num_experts, topk, 0, topk_ids.get_device()
+        )
+    workspace = torch.empty(ws_size, dtype=torch.uint8, device=device)
+    a1 = torch.empty((M, model_dim // 2), dtype=dtypes.fp4x2, device=device)
+    a1_scale_token = torch.empty(
+        (M, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    # A token-order-scale GEMM1 reads a1_scale_token; an empty a1_scale skips
+    # the P23 sorted-scale tail.
+    a1_scale = torch.empty(
+        (0 if tok_scale else (max_num_tokens_padded + 31) // 32 * 32, model_dim // 32),
+        dtype=dtypes.fp8_e8m0,
+        device=device,
+    )
+    aiter.moe_sorting_opus_quant_fwd(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        workspace,
+        m_indices,
+        reverse_sorted,
+        hidden_states,
+        a1,
+        a1_scale_token,
+        a1_scale,
+    )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        m_indices,
+        reverse_sorted,
+        a1,
+        a1_scale_token if tok_scale else a1_scale,
+    )
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -2088,6 +2212,37 @@ def _fused_moe_impl(
             else:
                 moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
             local_topk_ids = None
+        elif (
+            expert_mask is None
+            and num_local_tokens is None
+            and not need_local_topk_ids
+            and _opus_sort_quant_enabled(
+                metadata, hidden_states, topk_ids, block_size_M
+            )
+        ):
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+                prequantized_a1,
+                prequantized_a1_scale,
+            ) = _opus_sort_quant(
+                hidden_states,
+                topk_ids,
+                topk_weight,
+                global_E,
+                block_size_M,
+                dtype,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output=output,
+                tok_scale=_stage1_tok_scale(metadata),
+                one_launch=_stage1_one_launch_sort(metadata),
+            )
+            local_topk_ids = None
         else:
             # BM16's adaptive sort already emits routes and zeroes the output
             # without quantizing. Keep the Opus crossover for the configured aux
@@ -2862,6 +3017,18 @@ def _flydsl_stage2_wrapper(
     )
 
 
+def _stage1_tok_scale(metadata):
+    stage1 = metadata.stage1
+    return getattr(stage1, "func", stage1) is _mxfp4_a4w4_stage1_fw and bool(
+        _parse_mxfp4_g1_kname(stage1.keywords["kernelName1"]).get("tok_scale")
+    )
+
+
+def _stage1_one_launch_sort(metadata):
+    # Token-order-scale GEMM1s take the one-launch sort.
+    return _stage1_tok_scale(metadata)
+
+
 def _empty_bf16(device):
     return torch.empty((0,), dtype=dtypes.bf16, device=device)
 
@@ -2908,7 +3075,11 @@ def _mxfp4_a4w4_stage1(
     k_wave=1,
     prefetch_hidden=False,
     prequantized=False,
+    tail_split=0,
+    tok_scale=False,
 ):
+    if tok_scale and not prequantized:
+        raise ValueError("token-order A scales need a prequantized fp4 A")
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
             raise ValueError("MXMOE FP8 input requires sorted E8M0 activation scales")
@@ -3028,6 +3199,8 @@ def _mxfp4_a4w4_stage1(
         bias=bias1,
         num_waves=num_waves,
         k_wave=k_wave,
+        tail_split=tail_split,
+        tok_scale=tok_scale,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -3279,6 +3452,8 @@ def _mxfp4_a4w4_stage1_fw(
         k_wave=p1.get("k_wave", 1),
         prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
+        tail_split=p1.get("tail_split", 0),
+        tok_scale=p1.get("tok_scale", False),
     )
     return inter_sorted_quant, inter_sorted_scale
 
@@ -3460,6 +3635,7 @@ def _flydsl_v2_stage2_wrapper(
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+        _ROUTE_NT_MIN_BYTES,
         _validate_v2_gemm2_dtypes,
         mxfp4_moe_gemm2,
     )
@@ -3491,7 +3667,10 @@ def _flydsl_v2_stage2_wrapper(
             f"(model_dim={model_dim_runtime}, topk={topk})"
         )
     target = out
-    _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
+    # An ``_fp8_`` output dtype in the kernel name selects FP8 route rows per config.
+    _s2_fp8_inter = epilog == "reduce" and (
+        cfg["out_dtype"] == "fp8" or _flydsl_stage2_fp8_enabled()
+    )
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
     _defer_w = _s2_fp8_inter
@@ -3632,6 +3811,11 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            # Route rows past the MALL were stored nt by stage 2; stream them back.
+            streaming_loads=bool(
+                _s2_fp8_inter
+                and target.numel() * target.element_size() > _ROUTE_NT_MIN_BYTES
+            ),
         )
     return out
 
@@ -5614,6 +5798,16 @@ def fused_moe_2stages(
                 token_num=token_num,
                 cols=model_dim,
             )
+        elif _stage1_tok_scale(metadata):
+            # GEMM1 gathers the token-order scales itself: quantize only.
+            from aiter.ops.quant import per_1x32_mx_quant_hip
+
+            a1, a1_scale = per_1x32_mx_quant_hip(
+                hidden_states,
+                quant_dtype=dtypes.fp4x2,
+                shuffle=False,
+                num_rows=num_local_tokens,
+            )
         else:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
@@ -5728,7 +5922,21 @@ def fused_moe_2stages(
         _mxfp4_a4w4_stage2_fw,
     ):
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
-    if uses_flydsl_v2_stage2 and not doweight_stage1 and _flydsl_stage2_fp8_enabled():
+    if (
+        uses_flydsl_v2_stage2
+        and not doweight_stage1
+        and (
+            _flydsl_stage2_fp8_enabled()
+            or (
+                parse_flydsl_v2_gemm2_kernel(
+                    stage2_keywords.get("kernelName2")
+                    or stage2_keywords.get("kernelName")
+                )
+                or {}
+            ).get("out_dtype")
+            == "fp8"
+        )
+    ):
         # FP8 route-output reduction applies the route weights after GEMM2.
         extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:

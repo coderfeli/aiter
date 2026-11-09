@@ -8,6 +8,7 @@ _MXMOE_NUMERIC_TOKENS = {
     "SK": "kSplitK",
     "KW": "k_wave",
     "XCD": "xcd_swizzle",
+    "TS": "tail_split",
 }
 _MXMOE_G1_FLAG_TOKENS = {
     "NT",
@@ -17,6 +18,7 @@ _MXMOE_G1_FLAG_TOKENS = {
     "SITUV2",
     "SWIGLU",
     "W2",
+    "TKS",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -124,6 +126,8 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "act": act,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
+        "tail_split": nums.get("tail_split", 0),
+        "tok_scale": "TKS" in flags,
     }
 
 

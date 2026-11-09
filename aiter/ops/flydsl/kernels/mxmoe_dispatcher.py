@@ -6,19 +6,24 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .mxfp4_gemm_common import _udiv
+from .mxfp4_gemm_common import _raw, _udiv
 from .mxmoe_gemm_v2 import (
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
+    issue_ascale_lds,
+    issue_sweights_lds,
     kStages,
 )
+from .moe_pair_worklist import build_pair_worklist, take_pair_worklist
 from .tensor_shim import _run_compiled as run_compiled
+from .tensor_shim import _to_raw
 
 __all__ = [
     "compile_gemm2_a4w4_port",
@@ -46,6 +51,20 @@ def _validate_v2_gemm2_dtypes(a_dtype: str, b_dtype: str) -> None:
         ("fp8", "fp8"),
     }:
         raise AssertionError(f"unsupported v2 GEMM2 dtype pair {(a_dtype, b_dtype)!r}")
+
+
+# Max A-tile prefetch distance for the atomic GEMM2 K loop (bounded by free LDS slots).
+G2_A_DIST = 4
+
+
+def _loop_variant(v):
+    """Copy ``v`` through a side-effecting v_mov so loop-invariant code motion
+    cannot hoist the lane-derived offsets computed from it out of the loop."""
+    return fx.Int32(
+        llvm.inline_asm(
+            T.i32, [_to_raw(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True
+        )
+    )
 
 
 # ---- gemm2 (down-proj) compile ----
@@ -138,12 +157,33 @@ def compile_gemm2_a4w4_port(
     g2_prefetch_ids=False,
     _composition=None,
     _reduce_store_cache_modifier=None,
+    route_store_nt=False,
+    g2_tq=False,
     _input_row_resolver=None,
     _output_n_range=None,
     use_valid_token_count=False,
+    pair_list=False,
+    _pair_role=0,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
+    # Pair work list (BM64 atomic): a same-expert pair of 64-row sort blocks
+    # runs a 128-row body (B loaded once for both, role 1), every other block
+    # the 64-row body (role 2). One launch walks the block-ordered list that
+    # stage 1's pair launch built (moe_pair_worklist), passed as arg_eids.
+    # Captured as a function + an int, not a tuple: FlyDSL keys a captured
+    # tuple by repr(), which would put the function's address in the cache key.
+    pair_body = None
+    pair_lds_bytes = 0
+    if pair_list and _pair_role == 0:
+        if not (BM == SBM == 64 and epilog == "atomic" and _composition is None):
+            raise AssertionError("pair_list needs BM == SBM == 64 atomic")
+        kw = {k: v for k, v in locals().items() if k in _GEMM2_KWARGS}
+        kw.update(BM=128, SBM=128, persist=False, cu_num=0, pair_list=False)
+        pair_body, pair_lds_bytes = compile_gemm2_a4w4_port(**kw, _pair_role=1)
+        _pair_role = 2
+        persist = False
+        cu_num = 0
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce", "scatter"):
         raise AssertionError(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, "
@@ -241,11 +281,58 @@ def compile_gemm2_a4w4_port(
         # so lds_bytes and occupancy are unchanged; otherwise keep 2 and let
         # a_slot_alias fence the prefetch instead.
         aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
-    a_slot_alias = aStages <= kStages
-    lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     K_TILES_RT_MAX = INTER_MAX // BK
+    # A is DMA'd to LDS and waited with an in-order vmcnt, so its prefetch
+    # distance also bounds how many B loads stay in flight across the per-tile
+    # barrier. Use the A slots the C region already reserves.
+    g2_adist = kStages
+    if epilog == "atomic":
+        free_slots = c_lds_bytes // slot_bytes
+        g2_adist = max(kStages, min(G2_A_DIST, free_slots - 1, K_TILES_RT_MAX - 1))
+        aStages = max(aStages, g2_adist + 1)
+    a_slot_alias = aStages <= g2_adist
+    # BM128 holds 128 accumulator VGPRs; reading A per 32-row group instead of
+    # the whole tile is what lets it reach 2 waves/SIMD.
+    g2_jit_a = epilog == "atomic" and not is_f8 and BM >= 128 and not a_slot_alias
+    # JIT A ds_reads follow the next tile's A DMA; a tracked DMA makes the
+    # backend wait vmcnt(0) there (B prefetch included), so wait explicitly.
+    g2_async_a = g2_jit_a
+    # Sort padding rows of a block are distinct, never-written A rows: their
+    # in-loop DMAs load out of range instead (no memory request).
+    g2_pad_skip = (
+        epilog == "atomic"
+        and not is_f8
+        and BM >= 64
+        and _input_row_resolver is None
+    )
+    # The persistent BM64 loop waits on B (vmcnt); a second B tile in flight
+    # still fits 3 waves/SIMD there. Non-persistent BM64 measured slower.
+    g2_bdist = 2 if (BM == 64 and persist and epilog == "atomic") else 1
+    lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    # The JIT-A epilogue reads its BM sorted_weights from LDS: one async DMA
+    # issued with tile 0's A, instead of a global load the first thunk waits on.
+    g2_w_lds_off = None
+    if g2_jit_a and g2_bf16_lds and not g2_defer_weight:
+        g2_w_lds_off = lds_bytes
+        lds_bytes += 1024
+    # The block's A-scale words (shared by the 4 N-waves) go to LDS once with
+    # the A preload instead of per-chunk dword loads in every wave. Faster on
+    # persistent BM64 and BM128 only; the prologue DMA cost BM16/32 and
+    # one-shot BM64 0.2-0.6%.
+    g2_as_lds_off = None
+    as_ssb = max(1, (BM // 16) // 2)
+    as_ksc = (INTER_MAX + 255) // 256
+    as_lds_bytes = as_ssb * as_ksc * 256
+    if (
+        not use_scatter
+        and ((BM >= 64 and persist) or BM >= 128)
+        and as_lds_bytes % 1024 == 0
+    ):
+        g2_as_lds_off = lds_bytes
+        lds_bytes += as_lds_bytes
     g2_apre = aStages >= K_TILES_RT_MAX
-    a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
+    a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else g2_adist
+    lds_bytes = max(lds_bytes, pair_lds_bytes)
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -311,6 +398,13 @@ def compile_gemm2_a4w4_port(
     )
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if scatter_out_fp4 else "")
+    route_store_nt = bool(route_store_nt and route_out_fp8)
+    if route_store_nt:
+        out_tag += "_rnt"
+    g2_tq = bool(g2_tq and route_out_fp8 and use_reduce)
+    if g2_tq:
+        out_tag += "_tq"
+        g2_prefetch_ids = False
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
     valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
@@ -318,8 +412,10 @@ def compile_gemm2_a4w4_port(
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
-    name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
-        "_idpf" if g2_prefetch_ids else ""
+    name = (
+        f"gemm2_a4w4_port_{tag}{valid_tokens_tag}"
+        + ("_idpf" if g2_prefetch_ids else "")
+        + ("_pw" if _pair_role else "")
     )
 
     @fx.struct
@@ -368,6 +464,7 @@ def compile_gemm2_a4w4_port(
         lds,
         mn_idx=None,
         resolved_input_rows=(),
+        pair_row_e=None,
     ):
         if const_expr(use_scatter):
             i32_inter = fx.Int32(INTER_MAX)
@@ -382,7 +479,44 @@ def compile_gemm2_a4w4_port(
         aq_num = aq_rows * fx.Int64(k_bytes)
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
-        def issue_all_a_loads(m_row0):
+        def block_valid_rows(m_row0):
+            # Valid rows lead each sort block; padding carries token id >= M.
+            # Loaded here, counted by the body after its B prologue (no wait
+            # in front of the first loads).
+            stids_ptr = global_typed_ptr(arg_stids, T.i32)
+            packed = [
+                stids_ptr[m_row0 + lane + fx.Int32(64 * i)]
+                for i in range_constexpr(BM // 64)
+            ]
+
+            def count():
+                n = fx.Int32(0)
+                for p in packed:
+                    tok = p & fx.Int32(0xFFFFFF)
+                    mask = fx.Int64(rocdl.ballot(T.i64, tok < i32_M))
+                    n = n + fx.Int32(fx.math.ctpop(mask))
+                return n
+
+            return count
+
+        def issue_all_a_loads(m_row0, lane=lane):
+            if const_expr(g2_as_lds_off is not None):
+                issue_ascale_lds(
+                    arg_ascale,
+                    fx.Int64(i32_max_m_blocks) * fx.Int64(as_ssb * as_ksc * 256),
+                    lds_base_i32,
+                    g2_as_lds_off,
+                    _udiv(m_row0, 32),
+                    wave,
+                    lane,
+                    as_lds_bytes,
+                    as_ksc * 64,
+                    g2_async_a,
+                )
+            if const_expr(g2_w_lds_off is not None):
+                issue_sweights_lds(
+                    arg_sweights, lds_base_i32, g2_w_lds_off, m_row0, lane, BM
+                )
             for slot in range_constexpr(a_preload):
                 issue_a_load_lds_dt(
                     arg_aq,
@@ -398,6 +532,7 @@ def compile_gemm2_a4w4_port(
                     k_bytes,
                     BM=BM,
                     resolved_rows=resolved_input_rows,
+                    async_dma=g2_async_a,
                 )
 
         # Keep capacity for addressing and scheduling. Only atomic writes use
@@ -407,7 +542,9 @@ def compile_gemm2_a4w4_port(
             valid_tokens = global_typed_ptr(arg_cumsum, T.i32)[1]
             write_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
 
-        def run_unit(unit_bx, mn_idx=None):
+        def run_unit(
+            unit_bx, mn_idx=None, lane=lane, pair_row_e=None, a_valid_rows=None
+        ):
             gemm2_body_v2(
                 lds_base_i32,
                 arg_ascale,
@@ -452,15 +589,78 @@ def compile_gemm2_a4w4_port(
                 scatter_out_fp4=scatter_out_fp4,
                 arg_out_scale=arg_out_scale,
                 g2_prefetch_ids=g2_prefetch_ids,
+                g2_adist=g2_adist,
+                g2_jit_a=g2_jit_a,
+                g2_async_a=g2_async_a,
+                g2_w_lds_off=g2_w_lds_off,
+                g2_as_lds_off=g2_as_lds_off,
+                g2_bdist=g2_bdist,
                 mn_idx=mn_idx,
                 reduce_store_cache_modifier=_reduce_store_cache_modifier,
+                route_store_nt=route_store_nt,
+                g2_tq=g2_tq,
                 resolved_input_rows=resolved_input_rows,
                 output_n_base=output_n_base,
                 output_width=output_width,
                 write_limit=write_limit,
+                pair_row_e=pair_row_e,
+                a_valid_rows=a_valid_rows,
             )
 
-        if const_expr(mn_idx is not None):
+        if const_expr(pair_row_e is not None):
+            nv = block_valid_rows(pair_row_e[0]) if g2_pad_skip else None
+            issue_all_a_loads(pair_row_e[0])
+            rocdl.sched_barrier(0)
+            run_unit(
+                fx.Int32(0), mn_idx=mn_idx, pair_row_e=pair_row_e, a_valid_rows=nv
+            )
+        elif const_expr(_pair_role == 2):
+            # Entry y = (block << 16) | (is_pair << 15) | (is_half << 14) | expert;
+            # y >= count idles.
+            y = _udiv(bx_i32, num_n_blocks)
+            n_block = bx_i32 - y * num_n_blocks
+            pw = global_typed_ptr(arg_eids, T.i32)
+            count = rocdl.readfirstlane(T.i32, _raw(pw[0]))
+            packed = fx.Int32(rocdl.readfirstlane(T.i32, _raw(pw[y + 1])))
+            if fx.Int32(y) < fx.Int32(count):
+                row_e = (
+                    (packed >> fx.Int32(16)) * fx.Int32(BM),
+                    packed & fx.Int32(0x3FFF),
+                )
+                mn = (fx.Int32(0), n_block)
+                if ((packed >> fx.Int32(15)) & fx.Int32(1)) == fx.Int32(1):
+                    pair_body(
+                        arg_aq,
+                        arg_ascale,
+                        arg_bq,
+                        arg_bscale,
+                        arg_eids,
+                        arg_cumsum,
+                        arg_stids,
+                        arg_sweights,
+                        arg_bias,
+                        arg_out,
+                        arg_out_scale,
+                        bx_i32,
+                        lane,
+                        wave,
+                        i32_M,
+                        i32_max_m_blocks,
+                        i32_inter,
+                        i32_hidden,
+                        i32_grid_blocks,
+                        lds,
+                        mn_idx=mn,
+                        pair_row_e=row_e,
+                    )
+                else:
+                    nv_single = block_valid_rows(row_e[0]) if g2_pad_skip else None
+                    issue_all_a_loads(row_e[0])
+                    rocdl.sched_barrier(0)
+                    run_unit(
+                        fx.Int32(0), mn_idx=mn, pair_row_e=row_e, a_valid_rows=nv_single
+                    )
+        elif const_expr(mn_idx is not None):
             issue_all_a_loads(mn_idx[0] * fx.Int32(BM))
             rocdl.sched_barrier(0)
             run_unit(fx.Int32(0), mn_idx=mn_idx)
@@ -505,9 +705,13 @@ def compile_gemm2_a4w4_port(
                     g2_m01,
                 )
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                m_row0 = m_block_idx * fx.Int32(BM)
+                nv_spart = block_valid_rows(m_row0) if g2_pad_skip else None
+                issue_all_a_loads(m_row0)
                 rocdl.sched_barrier(0)
-                run_unit(unit_bx, mn_idx=(m_block_idx, n_block_idx))
+                run_unit(
+                    unit_bx, mn_idx=(m_block_idx, n_block_idx), a_valid_rows=nv_spart
+                )
         else:
             # Persistent-m: fixed cu_num*num_n_blocks grid; each block grid-strides m-tiles by cu_num (aiter `_persist`).
             m_tile0 = _udiv(bx_i32, num_n_blocks)
@@ -528,10 +732,12 @@ def compile_gemm2_a4w4_port(
                 m_block = m_tile0 + fx.Int32(_it) * c_stride
                 unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
                 gpu.barrier()  # persist: separate prev-iter epilog C-slab LDS reads from this iter's A-load into the shared LDS union
-                issue_all_a_loads(m_block * fx.Int32(BM))
+                # BM>=64: hoisted lane offsets cost ~22 VGPR (178 -> 156, 2 -> 3 waves/SIMD).
+                lane_it = _loop_variant(lane) if const_expr(BM >= 64) else lane
+                issue_all_a_loads(m_block * fx.Int32(BM), lane=lane_it)
                 rocdl.sched_barrier(0)
                 if fx.Int32(m_block) < total_m_blocks:
-                    run_unit(unit_bx)
+                    run_unit(unit_bx, lane=lane_it)
 
     @flyc.jit
     def _gemm2_tile(
@@ -584,6 +790,9 @@ def compile_gemm2_a4w4_port(
             mn_idx=(m_block_idx, n_block_idx),
             resolved_input_rows=resolved_rows,
         )
+
+    if _pair_role == 1:
+        return _gemm2_kernel_body, lds_bytes
 
     if _composition is not None:
         launch_gemm2 = _composition(
@@ -695,6 +904,14 @@ def compile_gemm2_a4w4_port(
     return launch_gemm2
 
 
+_GEMM2_KWARGS = frozenset(
+    __import__("inspect").signature(compile_gemm2_a4w4_port).parameters
+) - {"_pair_role"}
+
+
+# MI355X MALL (Infinity Cache) capacity.
+_ROUTE_NT_MIN_BYTES = 256 << 20
+
 # ---- launcher cache + dispatch (compile once per config, fast-dispatch after) ----
 G2_CACHE = {}
 
@@ -719,6 +936,9 @@ def get_g2(
     enable_bias=False,
     g2_prefetch_ids=False,
     use_valid_token_count=False,
+    pair_list=False,
+    route_store_nt=False,
+    g2_tq=False,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -759,6 +979,9 @@ def get_g2(
         enable_bias,
         g2_prefetch_ids,
         use_valid_token_count,
+        pair_list,
+        route_store_nt,
+        g2_tq,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -784,6 +1007,9 @@ def get_g2(
             enable_bias=enable_bias,
             g2_prefetch_ids=g2_prefetch_ids,
             use_valid_token_count=use_valid_token_count,
+            pair_list=pair_list,
+            route_store_nt=route_store_nt,
+            g2_tq=g2_tq,
         )
         G2_CACHE[key] = launch
     return launch
@@ -906,6 +1132,43 @@ def mxfp4_moe_gemm2(
         and bias is None
         and os.environ.get("MXFP4_G2_PREFETCH_IDS", "1") == "1"
     )
+    # Persistent BM64 atomic at large M (GLM-5: 257 experts, inter 2048): walk
+    # stage 1's pair work list instead, so a same-expert pair of sort blocks
+    # loads B once (the same gate as stage 1's pair launch).
+    pw = take_pair_worklist(sorted_expert_ids)
+    pair_list = (
+        persist
+        and (BM, SBM, BN, BK) == (64, 64, 256, 128)
+        and epilog == "atomic"
+        and a_dtype == b_dtype == "fp4"
+        and not use_nt
+        and NE >= 256
+        and D_INTER >= 2048
+        and bias is None
+        and not is_ep
+        and str(out_dtype).strip().lower() == "bf16"
+    )
+    if pair_list:
+        if pw is None:
+            pw = build_pair_worklist(
+                sorted_expert_ids,
+                cumsum_tensor,
+                sorted_token_ids,
+                M_logical,
+                SBM,
+                torch.cuda.current_stream() if stream is None else stream,
+            )
+        sorted_expert_ids = pw
+        persist = False
+    # FP8 route rows that overflow the MALL go out with nt stores.
+    route_store_nt = (
+        str(out_dtype).strip().lower() == "fp8"
+        and out.numel() * out.element_size() > _ROUTE_NT_MIN_BYTES
+    )
+    # FP8 route rows quantized straight from transposed C (no bf16 C slab).
+    g2_tq = g2_prefetch_ids and os.environ.get("MXFP4_G2_TQ", "0") == "1"
+    if g2_tq:
+        g2_prefetch_ids = False
     launch = get_g2(
         BM,
         BN,
@@ -926,9 +1189,14 @@ def mxfp4_moe_gemm2(
         enable_bias=bias is not None,
         g2_prefetch_ids=g2_prefetch_ids,
         use_valid_token_count=use_valid_token_count,
+        pair_list=pair_list,
+        route_store_nt=route_store_nt,
+        g2_tq=g2_tq,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
-    if persist:
+    if pair_list:
+        grid_blocks = pw.shape[0] - 1
+    elif persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
         grid_blocks = cu_num
     elif n_sorted_padded is not None:

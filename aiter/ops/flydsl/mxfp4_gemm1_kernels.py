@@ -33,6 +33,8 @@ def _get_compiled_mxfp4_gemm1_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    tail_split=0,
+    tok_scale=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -58,7 +60,15 @@ def _get_compiled_mxfp4_gemm1_port(
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
+        tail_split=tail_split,
+        tok_scale=tok_scale,
     )
+
+
+@functools.cache
+def _tail_split_ws(nbytes, device):
+    # Flags must start at zero; each split tile's last CTA resets its flag.
+    return torch.zeros(nbytes, dtype=torch.uint8, device=device)
 
 
 def _assert_supported(
@@ -231,8 +241,16 @@ def flydsl_mxfp4_gemm1(
     stream=None,
     num_waves=4,
     k_wave=1,
+    tail_split=0,
+    tok_scale=False,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
+    if tail_split > 1 and not (
+        BM == 128 and BN == 128 and bias is None and not inline_quant
+    ):
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 tail split-K requires BM128 x BN128 without bias"
+        )
     _assert_supported(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
@@ -276,8 +294,18 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout,
         num_waves,
         k_wave,
+        tail_split,
+        tok_scale,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+    bias_ptr = 0 if bias is None else bias.data_ptr()
+    if tail_split > 1:
+        from .kernels.mxfp4_gemm1 import tail_split_extra_ctas, tail_split_ws_bytes
+
+        grid += tail_split_extra_ctas(tail_split)
+        bias_ptr = _tail_split_ws(
+            tail_split_ws_bytes(BM, BN, tail_split), a_quant.device
+        ).data_ptr()
     _moe_kernels._run_compiled(
         launch,
         (
@@ -293,7 +321,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
-            0 if bias is None else bias.data_ptr(),
+            bias_ptr,
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )

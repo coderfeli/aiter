@@ -255,26 +255,36 @@ def c_shuffle_epilog(
                         row_ctx=row_ctx,
                         row_local=row_local,
                     ):
+                        # Values assigned in a dynamic if do not escape it,
+                        # so each arm issues its own store.
                         if _is_group_b:
                             frag = fx.ptr_load(
                                 lds_out_split + fx.Int32(lds_idx),
                                 result_type=vec_frag,
                             ).ir_value()
                             col_pair0 = col_pair0_local + _half_n_idx
+                            store_pair(
+                                row_local=row_local,
+                                row=row,
+                                row_ctx=row_ctx,
+                                col_pair0=col_pair0,
+                                col_g0=by_n_v + col_pair0,
+                                frag=frag,
+                            )
                         else:
                             frag = fx.ptr_load(
                                 lds_out + fx.Int32(lds_idx),
                                 result_type=vec_frag,
                             ).ir_value()
                             col_pair0 = col_pair0_local + _zero_idx
-                        store_pair(
-                            row_local=row_local,
-                            row=row,
-                            row_ctx=row_ctx,
-                            col_pair0=col_pair0,
-                            col_g0=by_n_v + col_pair0,
-                            frag=frag,
-                        )
+                            store_pair(
+                                row_local=row_local,
+                                row=row,
+                                row_ctx=row_ctx,
+                                col_pair0=col_pair0,
+                                col_g0=by_n_v + col_pair0,
+                                frag=frag,
+                            )
 
                     _grp_load_store()
 

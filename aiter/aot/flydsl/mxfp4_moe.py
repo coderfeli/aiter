@@ -99,6 +99,8 @@ def _job_key(job: dict) -> tuple:
             job["native_scale_layout"],
             job["num_waves"],
             job["k_wave"],
+            job["tail_split"],
+            job["tok_scale"],
         )
     return (
         2,
@@ -255,6 +257,8 @@ def parse_csv(
                                 ),
                                 "num_waves": p1.get("num_waves", 4),
                                 "k_wave": p1.get("k_wave", 1),
+                                "tail_split": p1.get("tail_split", 0),
+                                "tok_scale": p1.get("tok_scale", False),
                             }
                         )
 
@@ -403,6 +407,8 @@ def _compile_stage1(job):
         native_scale_layout=job["native_scale_layout"],
         num_waves=job["num_waves"],
         k_wave=job["k_wave"],
+        tail_split=job["tail_split"],
+        tok_scale=job["tok_scale"],
         stream=0,
     )
 
